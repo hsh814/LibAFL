@@ -11,7 +11,7 @@ use std::{env, fs::DirEntry, io, path::PathBuf, process};
 use clap::Parser;
 use libafl::{
     corpus::{Corpus, InMemoryCorpus},
-    events::{SendExiting, SimpleRestartingEventManager},
+    events::{SendExiting, SimpleRestartingEventManager, SimpleEventManager},
     executors::ExitKind,
     fuzzer::StdFuzzer,
     inputs::{BytesInput, HasTargetBytes},
@@ -27,8 +27,9 @@ use libafl_bolts::{
     AsSlice,
 };
 use libafl_qemu::{
+    elf::EasyElf,
     modules::SnapshotModule, ArchExtras, Emulator, GuestAddr, GuestReg, MmapPerms, Qemu,
-    QemuExecutor, QemuExitReason, QemuRWError, QemuShutdownCause, Regs,
+    QemuExecutor, QemuExitReason, QemuRWError, QemuShutdownCause, QemuHooks, Regs,
 };
 use log::info;
 
@@ -70,6 +71,24 @@ fn parse_snapshot_addr(s: &str) -> Result<GuestAddr, Error> {
     let cleaned = s.trim_start_matches("0x").trim_start_matches("0X");
     let addr = u64::from_str_radix(cleaned, 16)?;
     Ok(addr as GuestAddr)
+}
+
+unsafe extern "C" fn log_block_gen(_data: u64, pc: GuestAddr) -> u64 {
+    // pc == guest pc
+    eprintln!("[QEMU][TB_GEN] guest_pc = 0x{pc:x}");
+    pc as u64
+}
+
+unsafe extern "C" fn log_block_exec(_data: u64, id: u64) {
+    // id == guest_pc (위에서 넘긴 값)
+    if let Some(q) = Qemu::get() {
+        let current_pc: GuestReg = q.read_reg(Regs::Pc).unwrap();
+        eprintln!(
+            "[QEMU][TB_EXEC] guest_pc = 0x{id:x} (current_pc = 0x{current_pc:x})"
+        );
+    } else {
+        eprintln!("[QEMU][TB_EXEC] guest_pc = 0x{id:x}");
+    }
 }
 
 /// Run the snapshot harness.
@@ -125,12 +144,32 @@ pub fn run() -> Result<(), Error> {
         .expect("QEMU initialization failed");
 
     let qemu = emulator.qemu();
+    
+    let mut elf_buffer = Vec::new();
+    let elf = EasyElf::from_file(qemu.binary_path(), &mut elf_buffer)?;
+    let model_malloc_max_addr = elf  
+        .resolve_symbol("model_malloc_max", qemu.load_addr())  
+        .expect("Symbol model_malloc_max not found");  
+    info!("model_malloc_max @ 0x{model_malloc_max_addr:x}");
+    let load = qemu.load_addr();
+    eprintln!("[QEMU] load_addr = 0x{load:x}");
+    
+    qemu.entry_break(model_malloc_max_addr);
+
+    // Install basic-block (translation block) logging hooks for debugging.
+    if let Some(hooks) = QemuHooks::get() {
+        unsafe {
+            hooks.add_block_hooks(0u64, Some(log_block_gen), None, Some(log_block_exec));
+        }
+    } else {
+        info!("QemuHooks not initialized; block logging disabled");
+    }
 
     // Run to the snapshot address once, then let SnapshotModule snapshot that state
     // on the first `pre_exec` before fuzzing.
     info!("Running target until snapshot address 0x{snapshot_addr:x}");
     qemu.entry_break(snapshot_addr);
-    
+
     unsafe {
         match qemu.run() {
             Ok(QemuExitReason::Breakpoint(addr)) => {
