@@ -44,7 +44,7 @@ members = [
   "utils/drcov_utils",
   "utils/gramatron/construct_automata",
   "utils/libafl_benches",
-  "utils/libafl_jumper",
+  "utils/libafl_jumper", "fuzzers/binary_only/qemu_snapshot",
 ]
 
 default-members = [
