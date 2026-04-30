@@ -11,6 +11,7 @@ std = []
 x86_64 = ["libafl_qemu/x86_64"]
 
 [dependencies]
+capstone = "0.14.0"
 clap = { version = "4.5.18", features = ["derive", "string"] }
 env_logger = { version = "0.11.5" }
 libafl = { path = "../../../crates/libafl" }
