@@ -4,13 +4,9 @@ use capstone::{
 use clap::Parser;
 use libafl::{
     corpus::InMemoryCorpus,
-    events::SimpleEventManager,
-    executors::{Executor, ExitKind},
+    executors::ExitKind,
     feedbacks::CrashFeedback,
-    fuzzer::StdFuzzer,
     inputs::{Input, NopInput},
-    monitors::SimpleMonitor,
-    schedulers::QueueScheduler,
     state::StdState,
 };
 use libafl_bolts::{rands::StdRand, tuples::tuple_list, Error};
@@ -23,8 +19,8 @@ use libafl_qemu::{
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
         EmulatorModule, SnapshotModule,
     },
-    Emulator, GuestAddr, NopEmulatorDriver, NopSnapshotManager, Qemu, QemuExitReason, Regs,
-    TargetSignalHandling,
+    Emulator, GuestAddr, GuestUlong, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
+    QemuExitReason, Regs, SYS_exit, SYS_exit_group, SyscallHookResult, TargetSignalHandling,
 };
 use std::{
     cell::RefCell,
@@ -339,6 +335,36 @@ fn on_patch_loc_covered<ET, I, S>(
     record_patch_hit();
 }
 
+#[expect(clippy::too_many_arguments)]
+fn on_target_exit_syscall<ET, I, S>(
+    qemu: Qemu,
+    _emulator_modules: &mut libafl_qemu::EmulatorModules<ET, I, S>,
+    _state: Option<&mut S>,
+    syscall: i32,
+    _arg0: GuestUlong,
+    _arg1: GuestUlong,
+    _arg2: GuestUlong,
+    _arg3: GuestUlong,
+    _arg4: GuestUlong,
+    _arg5: GuestUlong,
+    _arg6: GuestUlong,
+    _arg7: GuestUlong,
+) -> SyscallHookResult
+where
+    ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
+    I: Unpin,
+    S: Unpin,
+{
+    if syscall == SYS_exit as i32 || syscall == SYS_exit_group as i32 {
+        if let Some(cpu) = qemu.current_cpu() {
+            cpu.trigger_breakpoint();
+            return SyscallHookResult::Skip(0);
+        }
+    }
+
+    SyscallHookResult::Run
+}
+
 fn parse_guest_addr(value: &str) -> Result<GuestAddr, String> {
     let trimmed = value.trim();
     let parsed = if let Some(hex) = trimmed.strip_prefix("0x") {
@@ -394,6 +420,7 @@ where
         ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
     {
         emulator_modules.crash_function(on_crash_stacktrace::<ET, I, S>);
+        emulator_modules.pre_syscalls(Hook::Function(on_target_exit_syscall::<ET, I, S>));
     }
 
     unsafe fn on_timeout(&mut self) {
@@ -412,7 +439,7 @@ struct Opts {
     patch_loc: usize,
 
     binary: PathBuf,
-    #[arg(trailing_var_arg = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     target_args: Vec<String>,
 }
 
@@ -437,7 +464,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(move |buf, record| {
             let elapsed = start_time.elapsed().as_millis();
-            writeln!(buf, "{}ms {}", elapsed, record.args())
+            writeln!(buf, "{} [time {}]", record.args(), elapsed)
         })
         .init();
 
@@ -473,10 +500,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &mut feedback,
         &mut objective,
     )?;
-    let scheduler = QueueScheduler::new();
-    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
-    let monitor = SimpleMonitor::new(|s| log::info!("{s}"));
-    let mut mgr = SimpleEventManager::new(monitor);
 
     type State = StdState<InMemoryCorpus<NopInput>, NopInput, StdRand, InMemoryCorpus<NopInput>>;
 
@@ -529,51 +552,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     qemu.entry_break(entry);
-    emulator.modules_mut().first_exec_all(qemu, &mut state);
+    emulator.first_exec(&mut state);
     emulator.set_target_crash_handling(&TargetSignalHandling::ReturnToHarness);
 
     log::info!("running {} @ {entry:#x}", binary.display());
 
-    let harness = move |_emulator: &mut Emulator<_, _, _, _, _, _, _>,
-                        _state: &mut State,
-                        _input: &NopInput|
-          -> ExitKind {
-        unsafe {
-            match qemu.run() {
-                Ok(QemuExitReason::Crash) => ExitKind::Crash,
-                Ok(QemuExitReason::Timeout) => ExitKind::Timeout,
-                Ok(QemuExitReason::SyncExit) => ExitKind::Ok,
-                Ok(QemuExitReason::End(_)) => ExitKind::Ok,
-                Ok(QemuExitReason::Breakpoint(_)) => ExitKind::Ok,
-                Err(_) => ExitKind::Crash,
-            }
+    let input = NopInput::new();
+    emulator.pre_exec(&mut state, &input);
+    let mut exit_kind = unsafe {
+        match qemu.run() {
+            Ok(QemuExitReason::Crash) => ExitKind::Crash,
+            Ok(QemuExitReason::Timeout) => ExitKind::Timeout,
+            Ok(QemuExitReason::SyncExit) => ExitKind::Ok,
+            Ok(QemuExitReason::End(_)) => ExitKind::Ok,
+            Ok(QemuExitReason::Breakpoint(_)) => ExitKind::Ok,
+            Err(_) => ExitKind::Crash,
         }
     };
-
-    let timeout = std::time::Duration::from_secs(30);
-    let mut executor = libafl_qemu::QemuExecutor::new(
-        emulator,
-        harness,
-        (),
-        &mut fuzzer,
-        &mut state,
-        &mut mgr,
-        timeout,
-    )?;
-
-    let input = NopInput::new();
-    let result = executor.run_target(&mut fuzzer, &mut state, &mut mgr, &input);
+    let mut observers = ();
+    emulator.post_exec(&input, &mut observers, &mut state, &mut exit_kind);
 
     let resolver = AddressResolver::new(&qemu);
 
-    match &result {
-        Ok(ExitKind::Crash) => log::info!("result: crash"),
-        Ok(ExitKind::Ok) => log::info!("result: exit"),
-        Ok(other) => log::info!("result: {other:?}"),
-        Err(err) => log::info!("result: error: {err:?}"),
+    match exit_kind {
+        ExitKind::Crash => log::info!("[exit] [result crash]"),
+        ExitKind::Ok => log::info!("[exit] [result ok]"),
+        other => log::info!("[exit] [result {other:?}]"),
     }
 
-    if matches!(result, Ok(ExitKind::Crash)) {
+    if matches!(exit_kind, ExitKind::Crash) {
         log::info!("stacktrace:");
         if let Some(frames) = FullBacktraceCollector::backtrace() {
             for (idx, addr) in frames.iter().rev().enumerate() {
@@ -597,7 +604,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if summary.hits > 0 {
             if summary.function_entries.is_empty() {
                 log::info!(
-                    "[patch-func] [location {addr:#x}] [entry unknown] [hits {}]",
+                    "[patch-func] [location {addr:#x}] [entry unknown] [unknown-hits {}]",
                     summary.unknown_hits
                 );
             } else if summary.function_entries.len() == 1 && summary.unknown_hits == 0 {
@@ -614,7 +621,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .collect::<Vec<_>>()
                     .join(",");
                 log::info!(
-                    "[patch-func] [location {addr:#x}] [entries {entries}] [entry-count {}] [hits {}]",
+                    "[patch-func] [location {addr:#x}] [entries {entries}] [entry-count {}] [unknown-hits {}]",
                     summary.function_entries.len(),
                     summary.unknown_hits
                 );
