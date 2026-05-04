@@ -9,7 +9,12 @@ use libafl::{
     inputs::{Input, NopInput},
     state::StdState,
 };
-use libafl_bolts::{rands::StdRand, tuples::tuple_list, Error};
+use libafl_bolts::{
+    rands::StdRand,
+    target_args::{StdTargetArgs, StdTargetArgsInner},
+    tuples::tuple_list,
+    Error,
+};
 use libafl_qemu::{
     capstone as qemu_capstone,
     command::{NopCommand, NopCommandManager},
@@ -437,6 +442,8 @@ where
 struct Opts {
     #[arg(short, long, default_value = "0", value_parser = parse_guest_addr)]
     patch_loc: usize,
+    #[arg(short, long)]
+    input: PathBuf,
 
     binary: PathBuf,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -472,6 +479,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let opts = Opts::parse();
     let binary = opts.binary;
+    let input = opts.input;
     let mut elf_buf = Vec::new();
     let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
 
@@ -486,10 +494,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         StackTracePrinter::default(),
     );
 
+    let input_path = input.to_string_lossy().into_owned();
     let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());
     qemu_args.push(env::args().next().unwrap());
     qemu_args.push(binary.to_string_lossy().into_owned());
-    qemu_args.extend(opts.target_args);
+    qemu_args.extend(opts.target_args.into_iter().map(|arg| {
+        if arg == "@@" {
+            input_path.clone()
+        } else {
+            arg
+        }
+    }));
 
     let mut feedback = CrashFeedback::new();
     let mut objective = CrashFeedback::new();
