@@ -9,12 +9,7 @@ use libafl::{
     inputs::{Input, NopInput},
     state::StdState,
 };
-use libafl_bolts::{
-    rands::StdRand,
-    target_args::{StdTargetArgs, StdTargetArgsInner},
-    tuples::tuple_list,
-    Error,
-};
+use libafl_bolts::{rands::StdRand, tuples::tuple_list, Error};
 use libafl_qemu::{
     capstone as qemu_capstone,
     command::{NopCommand, NopCommandManager},
@@ -619,12 +614,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if summary.hits > 0 {
             if summary.function_entries.is_empty() {
                 log::info!(
-                    "[patch-func] [location {addr:#x}] [entry unknown] [unknown-hits {}]",
+                    "[patch-func] [location {addr:#x}] [entry-cnt 0] [entry unknown] [hits {}]",
                     summary.unknown_hits
                 );
             } else if summary.function_entries.len() == 1 && summary.unknown_hits == 0 {
                 log::info!(
-                    "[patch-func] [location {addr:#x}] [entry {:#x}] [hits {}]",
+                    "[patch-func] [location {addr:#x}] [entry-cnt 1] [entry {:#x}] [hits {}]",
                     summary.function_entries[0],
                     summary.hits
                 );
@@ -636,10 +631,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .collect::<Vec<_>>()
                     .join(",");
                 log::info!(
-                    "[patch-func] [location {addr:#x}] [entries {entries}] [entry-count {}] [unknown-hits {}]",
+                    "[patch-func] [location {addr:#x}] [entry-cnt {}] [entry {:#x}] [hits {}]",
                     summary.function_entries.len(),
+                    summary.function_entries[0],
                     summary.unknown_hits
                 );
+                log::info!("patch entries: {entries}");
             }
         }
     }
