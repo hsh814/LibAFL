@@ -24,7 +24,7 @@ use libafl_qemu::{
 };
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env, fmt,
     io::Write,
     path::PathBuf,
@@ -43,6 +43,7 @@ static PATCH_LOC_COVERED: AtomicBool = AtomicBool::new(false);
 struct FunctionFrame {
     entry: Option<GuestAddr>,
     return_addr: GuestAddr,
+    saw_patch_hit: bool,
 }
 
 #[derive(Debug, Default)]
@@ -51,7 +52,7 @@ struct RuntimeTraceState {
     visited_basic_blocks: BTreeMap<GuestAddr, usize>,
     patch_hits: usize,
     patch_unknown_hits: usize,
-    patch_function_entries: BTreeSet<GuestAddr>,
+    patch_function_calls: BTreeMap<GuestAddr, usize>,
 }
 
 impl RuntimeTraceState {
@@ -60,11 +61,12 @@ impl RuntimeTraceState {
         self.function_stack.push(FunctionFrame {
             entry: Some(root_entry),
             return_addr: 0,
+            saw_patch_hit: false,
         });
         self.visited_basic_blocks.clear();
         self.patch_hits = 0;
         self.patch_unknown_hits = 0;
-        self.patch_function_entries.clear();
+        self.patch_function_calls.clear();
     }
 
     fn on_basic_block_hit(&mut self, addr: GuestAddr) {
@@ -72,8 +74,11 @@ impl RuntimeTraceState {
     }
 
     fn on_call(&mut self, entry: Option<GuestAddr>, return_addr: GuestAddr) {
-        self.function_stack
-            .push(FunctionFrame { entry, return_addr });
+        self.function_stack.push(FunctionFrame {
+            entry,
+            return_addr,
+            saw_patch_hit: false,
+        });
     }
 
     fn on_ret(&mut self, return_addr: GuestAddr) {
@@ -85,14 +90,17 @@ impl RuntimeTraceState {
         }
     }
 
-    fn current_function_entry(&self) -> Option<GuestAddr> {
-        self.function_stack.last().and_then(|frame| frame.entry)
-    }
-
     fn on_patch_hit(&mut self) {
         self.patch_hits += 1;
-        if let Some(entry) = self.current_function_entry() {
-            self.patch_function_entries.insert(entry);
+        if let Some(frame) = self.function_stack.last_mut() {
+            if let Some(entry) = frame.entry {
+                if !frame.saw_patch_hit {
+                    *self.patch_function_calls.entry(entry).or_insert(0) += 1;
+                    frame.saw_patch_hit = true;
+                }
+            } else {
+                self.patch_unknown_hits += 1;
+            }
         } else {
             self.patch_unknown_hits += 1;
         }
@@ -102,7 +110,11 @@ impl RuntimeTraceState {
         PatchSummary {
             hits: self.patch_hits,
             unknown_hits: self.patch_unknown_hits,
-            function_entries: self.patch_function_entries.iter().copied().collect(),
+            function_call_entries: self
+                .patch_function_calls
+                .iter()
+                .map(|(addr, calls)| (*addr, *calls))
+                .collect(),
         }
     }
 
@@ -118,7 +130,7 @@ impl RuntimeTraceState {
 struct PatchSummary {
     hits: usize,
     unknown_hits: usize,
-    function_entries: Vec<GuestAddr>,
+    function_call_entries: Vec<(GuestAddr, usize)>,
 }
 
 std::thread_local! {
@@ -336,7 +348,7 @@ impl CallTraceCollector for RuntimeFunctionTracker {
                 state.visited_basic_blocks.clear();
                 state.patch_hits = 0;
                 state.patch_unknown_hits = 0;
-                state.patch_function_entries.clear();
+                state.patch_function_calls.clear();
             }
         });
     }
@@ -689,31 +701,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             summary.hits
         );
         if summary.hits > 0 {
-            if summary.function_entries.is_empty() {
+            if summary.function_call_entries.is_empty() {
                 log::info!(
-                    "[patch-func] [location {addr:#x}] [entry-cnt 0] [entry unknown] [hits {}]",
+                    "[patch-func] [location {addr:#x}] [entry 0] [hit {}]",
                     summary.unknown_hits
-                );
-            } else if summary.function_entries.len() == 1 && summary.unknown_hits == 0 {
-                log::info!(
-                    "[patch-func] [location {addr:#x}] [entry-cnt 1] [entry {:#x}] [hits {}]",
-                    summary.function_entries[0],
-                    summary.hits
                 );
             } else {
-                let entries = summary
-                    .function_entries
-                    .iter()
-                    .map(|entry| format!("{entry:#x}"))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                log::info!(
-                    "[patch-func] [location {addr:#x}] [entry-cnt {}] [entry {:#x}] [hits {}]",
-                    summary.function_entries.len(),
-                    summary.function_entries[0],
-                    summary.unknown_hits
-                );
-                log::info!("patch entries: {entries}");
+                for (entry, calls) in &summary.function_call_entries {
+                    log::info!(
+                        "[patch-func] [location {addr:#x}] [entry {entry:#x}] [hit {calls}]"
+                    );
+                }
             }
         }
     }
