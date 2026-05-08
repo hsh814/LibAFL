@@ -19,12 +19,12 @@ use libafl_qemu::{
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
         EmulatorModule, SnapshotModule,
     },
-    Emulator, GuestAddr, GuestUlong, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
+    Emulator, GuestAddr, GuestUlong, GuestUsize, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
     QemuExitReason, Regs, SYS_exit, SYS_exit_group, SyscallHookResult, TargetSignalHandling,
 };
 use std::{
     cell::RefCell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fmt,
     io::Write,
     path::PathBuf,
@@ -48,6 +48,7 @@ struct FunctionFrame {
 #[derive(Debug, Default)]
 struct RuntimeTraceState {
     function_stack: Vec<FunctionFrame>,
+    visited_basic_blocks: BTreeMap<GuestAddr, usize>,
     patch_hits: usize,
     patch_unknown_hits: usize,
     patch_function_entries: BTreeSet<GuestAddr>,
@@ -60,9 +61,14 @@ impl RuntimeTraceState {
             entry: Some(root_entry),
             return_addr: 0,
         });
+        self.visited_basic_blocks.clear();
         self.patch_hits = 0;
         self.patch_unknown_hits = 0;
         self.patch_function_entries.clear();
+    }
+
+    fn on_basic_block_hit(&mut self, addr: GuestAddr) {
+        *self.visited_basic_blocks.entry(addr).or_insert(0) += 1;
     }
 
     fn on_call(&mut self, entry: Option<GuestAddr>, return_addr: GuestAddr) {
@@ -99,6 +105,13 @@ impl RuntimeTraceState {
             function_entries: self.patch_function_entries.iter().copied().collect(),
         }
     }
+
+    fn basic_block_summary(&self) -> Vec<(GuestAddr, usize)> {
+        self.visited_basic_blocks
+            .iter()
+            .map(|(addr, hits)| (*addr, *hits))
+            .collect()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -121,6 +134,16 @@ fn record_patch_hit() {
 
 fn patch_summary() -> PatchSummary {
     RUNTIME_TRACE_STATE.with(|state| state.borrow().patch_summary())
+}
+
+fn basic_block_summary() -> Vec<(GuestAddr, usize)> {
+    RUNTIME_TRACE_STATE.with(|state| state.borrow().basic_block_summary())
+}
+
+fn record_basic_block_hit(addr: GuestAddr) {
+    RUNTIME_TRACE_STATE.with(|state| {
+        state.borrow_mut().on_basic_block_hit(addr);
+    });
 }
 
 struct RuntimeFunctionTracker {
@@ -310,6 +333,7 @@ impl CallTraceCollector for RuntimeFunctionTracker {
             if let Some(root_entry) = root_entry {
                 state.reset(root_entry);
             } else {
+                state.visited_basic_blocks.clear();
                 state.patch_hits = 0;
                 state.patch_unknown_hits = 0;
                 state.patch_function_entries.clear();
@@ -319,7 +343,49 @@ impl CallTraceCollector for RuntimeFunctionTracker {
 }
 
 #[derive(Debug, Default)]
-struct StackTracePrinter;
+struct StackTracePrinter {
+    trace_basic_blocks: bool,
+}
+
+fn on_basic_block_generated<ET, I, S>(
+    _qemu: Qemu,
+    _emulator_modules: &mut libafl_qemu::EmulatorModules<ET, I, S>,
+    _state: Option<&mut S>,
+    pc: GuestAddr,
+) -> Option<u64>
+where
+    ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
+    I: Unpin,
+    S: Unpin,
+{
+    Some(pc as u64)
+}
+
+fn on_basic_block_post_generated<ET, I, S>(
+    _qemu: Qemu,
+    _emulator_modules: &mut libafl_qemu::EmulatorModules<ET, I, S>,
+    _state: Option<&mut S>,
+    _pc: GuestAddr,
+    _block_length: GuestUsize,
+) where
+    ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
+    I: Unpin,
+    S: Unpin,
+{
+}
+
+fn on_basic_block_executed<ET, I, S>(
+    _qemu: Qemu,
+    _emulator_modules: &mut libafl_qemu::EmulatorModules<ET, I, S>,
+    _state: Option<&mut S>,
+    id: u64,
+) where
+    ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
+    I: Unpin,
+    S: Unpin,
+{
+    record_basic_block_hit(id as GuestAddr);
+}
 
 fn on_patch_loc_covered<ET, I, S>(
     _qemu: Qemu,
@@ -419,6 +485,13 @@ where
     ) where
         ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
     {
+        if self.trace_basic_blocks {
+            emulator_modules.hooks_mut().blocks(
+                Hook::Function(on_basic_block_generated::<ET, I, S>),
+                Hook::Function(on_basic_block_post_generated::<ET, I, S>),
+                Hook::Function(on_basic_block_executed::<ET, I, S>),
+            );
+        }
         emulator_modules.crash_function(on_crash_stacktrace::<ET, I, S>);
         emulator_modules.pre_syscalls(Hook::Function(on_target_exit_syscall::<ET, I, S>));
     }
@@ -437,6 +510,8 @@ where
 struct Opts {
     #[arg(short, long, default_value = "0", value_parser = parse_guest_addr)]
     patch_loc: usize,
+    #[arg(long)]
+    trace_basic_blocks: bool,
     #[arg(short, long)]
     input: PathBuf,
 
@@ -486,7 +561,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             StdAddressFilter::default(),
             tuple_list!(full_backtrace, runtime_function_tracker)
         ),
-        StackTracePrinter::default(),
+        StackTracePrinter {
+            trace_basic_blocks: opts.trace_basic_blocks,
+        },
     );
 
     let input_path = input.to_string_lossy().into_owned();
@@ -536,7 +613,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 binary.display()
             ))) as Box<dyn std::error::Error>
         })?;
-    log::info!("entry point: {entry:#x}");
+    log::info!("[entry] [address {entry:#x}]");
 
     let patch_loc = opts.patch_loc;
     let patch_loc_runtime: Option<usize> = if patch_loc != 0 {
@@ -638,6 +715,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 log::info!("patch entries: {entries}");
             }
+        }
+    }
+
+    if opts.trace_basic_blocks {
+        let basic_blocks = basic_block_summary();
+        log::info!("[bb] [count {}]", basic_blocks.len());
+        for (idx, (addr, hits)) in basic_blocks.iter().enumerate() {
+            log::info!("[bb] [idx {idx}] [addr {addr:#x}] [hits {hits}]");
         }
     }
 
