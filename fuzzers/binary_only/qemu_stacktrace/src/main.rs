@@ -136,6 +136,7 @@ struct PatchSummary {
 std::thread_local! {
     static RUNTIME_TRACE_STATE: RefCell<RuntimeTraceState> =
         RefCell::new(RuntimeTraceState::default());
+    static TARGET_EXEC_RANGE: RefCell<Option<(GuestAddr, GuestAddr)>> = RefCell::new(None);
 }
 
 fn record_patch_hit() {
@@ -152,10 +153,28 @@ fn basic_block_summary() -> Vec<(GuestAddr, usize)> {
     RUNTIME_TRACE_STATE.with(|state| state.borrow().basic_block_summary())
 }
 
+fn set_target_exec_range(range: Option<(GuestAddr, GuestAddr)>) {
+    TARGET_EXEC_RANGE.with(|state| {
+        *state.borrow_mut() = range;
+    });
+}
+
+fn target_exec_range() -> Option<(GuestAddr, GuestAddr)> {
+    TARGET_EXEC_RANGE.with(|state| *state.borrow())
+}
+
 fn record_basic_block_hit(addr: GuestAddr) {
     RUNTIME_TRACE_STATE.with(|state| {
         state.borrow_mut().on_basic_block_hit(addr);
     });
+}
+
+fn find_last_guest_frame(frames: &[GuestAddr]) -> Option<(usize, GuestAddr)> {
+    let (range_start, range_end) = target_exec_range()?;
+
+    frames.iter().enumerate().rev().find_map(|(idx, addr)| {
+        ((*addr >= range_start) && (*addr < range_end)).then_some((idx, *addr))
+    })
 }
 
 struct RuntimeFunctionTracker {
@@ -480,6 +499,12 @@ fn dump_stacktrace(qemu: Qemu, reason: &str) {
         for (idx, addr) in frames.iter().rev().enumerate() {
             eprintln!("\t#{idx} {addr:#x}{}", resolver.resolve(*addr));
         }
+        if let Some((idx, addr)) = find_last_guest_frame(&frames) {
+            eprintln!(
+                "\t[fault-addr] [idx {idx}] [addr {addr:#x}] [symbol {}]",
+                resolver.resolve(addr)
+            );
+        }
     } else {
         eprintln!("\t(no stack collected)");
     }
@@ -627,6 +652,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     log::info!("[entry] [address {entry:#x}]");
 
+    let entry_addr = entry as GuestAddr;
+    let target_exec_range = qemu.mappings().find_map(|map| {
+        let start = map.start() as GuestAddr;
+        let end = map.end() as GuestAddr;
+        (start <= entry_addr && entry_addr < end).then_some((start, end))
+    });
+    set_target_exec_range(target_exec_range);
+
     let patch_loc = opts.patch_loc;
     let patch_loc_runtime: Option<usize> = if patch_loc != 0 {
         if elf.is_pic() {
@@ -686,6 +719,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 log::info!(
                     "[stacktrace] [idx {idx}] [addr {addr:#x}] [symbol {}]",
                     resolver.resolve(*addr)
+                );
+            }
+            if let Some((idx, addr)) = find_last_guest_frame(&frames) {
+                log::info!(
+                    "[fault-addr] [idx {idx}] [addr {addr:#x}] [symbol {}]",
+                    resolver.resolve(addr)
                 );
             }
         } else {
