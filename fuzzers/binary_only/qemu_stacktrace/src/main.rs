@@ -17,10 +17,11 @@ use libafl_qemu::{
     modules::{
         calls::{CallTraceCollector, CallTracerModule, FullBacktraceCollector},
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
-        EmulatorModule, SnapshotModule,
+        EmulatorModule, RedirectStdoutModule,
     },
     Emulator, GuestAddr, GuestUlong, GuestUsize, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
-    QemuExitReason, Regs, SYS_exit, SYS_exit_group, SyscallHookResult, TargetSignalHandling,
+    QemuExitReason, QemuShutdownCause, Regs, SYS_exit, SYS_exit_group, SyscallHookResult,
+    TargetSignalHandling,
 };
 use std::{
     cell::RefCell,
@@ -176,6 +177,36 @@ fn find_last_guest_frame(frames: &[GuestAddr]) -> Option<(usize, GuestAddr)> {
         ((*addr >= range_start) && (*addr < range_end)).then_some((idx, *addr))
     })
 }
+
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGILL => "SIGILL",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGTRAP => "SIGTRAP",
+        _ => "UNKNOWN",
+    }
+}
+
+fn shutdown_cause_detail(cause: &QemuShutdownCause) -> String {
+    match cause {
+        QemuShutdownCause::None => "no shutdown cause reported".to_string(),
+        QemuShutdownCause::HostError => "host-side QEMU error".to_string(),
+        QemuShutdownCause::HostQmpQuit => "QMP quit requested by host".to_string(),
+        QemuShutdownCause::HostQmpSystemReset => "QMP system reset requested by host".to_string(),
+        QemuShutdownCause::HostSignal(signal) => format!("host signal {signal:?}"),
+        QemuShutdownCause::HostUi => "host UI requested shutdown".to_string(),
+        QemuShutdownCause::GuestShutdown => "guest requested shutdown".to_string(),
+        QemuShutdownCause::GuestReset => "guest requested reset".to_string(),
+        QemuShutdownCause::GuestPanic => "guest panic".to_string(),
+        QemuShutdownCause::SubsystemReset => "subsystem reset".to_string(),
+        QemuShutdownCause::SnapshotLoad => "snapshot load completed".to_string(),
+    }
+}
+
+fn suppress_guest_output(_: &[u8]) {}
 
 struct RuntimeFunctionTracker {
     cs: Capstone,
@@ -480,13 +511,15 @@ fn parse_guest_addr(value: &str) -> Result<GuestAddr, String> {
 fn on_crash_stacktrace<ET, I, S>(
     qemu: Qemu,
     _modules: &mut libafl_qemu::EmulatorModules<ET, I, S>,
-    _sig: i32,
+    sig: i32,
 ) where
     ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
     I: Unpin,
     S: Unpin,
 {
-    dump_stacktrace(qemu, "crash");
+    let reason = format!("crash (signal {sig} {})", signal_name(sig));
+    log::info!("[crash] [signal {sig}] [name {}]", signal_name(sig));
+    dump_stacktrace(qemu, &reason);
     if let Some(cpu) = qemu.current_cpu() {
         eprint!("QEMU Context:\n{}", cpu.display_context());
     }
@@ -592,8 +625,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let full_backtrace = unsafe { FullBacktraceCollector::new() };
     let runtime_function_tracker = RuntimeFunctionTracker::new();
+    let redirect_stdout = RedirectStdoutModule::new()
+        .with_stdout(suppress_guest_output)
+        .with_stderr(suppress_guest_output);
     let modules = tuple_list!(
-        SnapshotModule::new(),
+        redirect_stdout,
         CallTracerModule::new(
             StdAddressFilter::default(),
             tuple_list!(full_backtrace, runtime_function_tracker)
@@ -691,14 +727,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let input = NopInput::new();
     emulator.pre_exec(&mut state, &input);
-    let mut exit_kind = unsafe {
-        match qemu.run() {
-            Ok(QemuExitReason::Crash) => ExitKind::Crash,
-            Ok(QemuExitReason::Timeout) => ExitKind::Timeout,
-            Ok(QemuExitReason::SyncExit) => ExitKind::Ok,
-            Ok(QemuExitReason::End(_)) => ExitKind::Ok,
-            Ok(QemuExitReason::Breakpoint(_)) => ExitKind::Ok,
-            Err(_) => ExitKind::Crash,
+    let qemu_exit = unsafe { qemu.run() };
+    log::info!("exit-raw {:?}", qemu_exit);
+
+    let mut exit_kind = match qemu_exit {
+        Ok(QemuExitReason::Crash) => {
+            log::info!("[qemu-exit] [kind crash] [detail target crash]");
+            ExitKind::Crash
+        }
+        Ok(QemuExitReason::Timeout) => {
+            log::info!("[qemu-exit] [kind timeout] [detail execution timed out]");
+            ExitKind::Timeout
+        }
+        Ok(QemuExitReason::SyncExit) => {
+            log::info!("[qemu-exit] [kind sync exit] [detail guest requested synchronous exit]");
+            ExitKind::Ok
+        }
+        Ok(QemuExitReason::End(reason)) => {
+            log::info!(
+                "[qemu-exit] [kind end] [detail {}]",
+                shutdown_cause_detail(&reason)
+            );
+            ExitKind::Ok
+        }
+        Ok(QemuExitReason::Breakpoint(reason)) => {
+            log::info!("[qemu-exit] [kind breakpoint] [detail trigger address {reason:#x}]");
+            ExitKind::Ok
+        }
+        Err(err) => {
+            log::info!("[qemu-exit] [kind error] [detail {:?}]", err);
+            ExitKind::Crash
         }
     };
     let mut observers = ();
@@ -709,6 +767,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match exit_kind {
         ExitKind::Crash => log::info!("[exit] [result crash]"),
         ExitKind::Ok => log::info!("[exit] [result ok]"),
+        ExitKind::Timeout => log::info!("[exit] [result timeout]"),
         other => log::info!("[exit] [result {other:?}]"),
     }
 
@@ -742,13 +801,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if summary.hits > 0 {
             if summary.function_call_entries.is_empty() {
                 log::info!(
-                    "[patch-func] [location {addr:#x}] [entry 0] [hit {}]",
+                    "[patch-func] [location {addr:#x}] [entry 0] [hits {}]",
                     summary.unknown_hits
                 );
             } else {
                 for (entry, calls) in &summary.function_call_entries {
                     log::info!(
-                        "[patch-func] [location {addr:#x}] [entry {entry:#x}] [hit {calls}]"
+                        "[patch-func] [location {addr:#x}] [entry {entry:#x}] [hits {calls}]"
                     );
                 }
             }
