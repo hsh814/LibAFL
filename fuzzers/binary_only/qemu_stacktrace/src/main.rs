@@ -243,9 +243,16 @@ fn note_input_file_alias(old_fd: i32, new_fd: i32) {
     });
 }
 
-fn note_input_file_close(fd: i32) {
+fn note_input_file_close(fd: i32, result: GuestUlong) {
     INPUT_TRACE_STATE.with(|state| {
         let mut state = state.borrow_mut();
+        if state.input_fds.contains(&fd) {
+            let offset = input_fd_offset(&state, fd).unwrap_or(-1);
+            log::info!(
+                "[input-trace] [close] [fd {fd}] [offset {offset}] [result {result}] [after_patch {}]",
+                state.patch_func_entry_hit
+            );
+        }
         if let Some(group_id) = state.fd_groups.remove(&fd) {
             state.input_fds.remove(&fd);
             if !state
@@ -267,12 +274,12 @@ fn note_input_file_lseek(fd: i32, offset: i64, whence: i32, result: GuestUlong) 
                 let new_offset = result as i64;
                 update_input_fd_offset(&mut state, fd, new_offset);
                 log::info!(
-                    "[input-trace] [lseek] [fd {fd}] [offset {offset}] [whence {whence}] [new_offset {new_offset}] [after_patch {}]",
+                    "[input-trace] [lseek] [fd {fd}] [offset {offset}] [whence {whence}] [new_offset {new_offset}] [succ true] [after_patch {}]",
                     state.patch_func_entry_hit
                 );
             } else {
                 log::info!(
-                    "[input-trace] [lseek] [fd {fd}] [offset {offset}] [whence {whence}] [result {result}] [after_patch {}]",
+                    "[input-trace] [lseek] [fd {fd}] [offset {offset}] [whence {whence}] [new_offset {result}] [succ false] [after_patch {}]",
                     state.patch_func_entry_hit
                 );
             }
@@ -387,7 +394,7 @@ fn track_input_file_syscall(
                     if let Ok(fd) = i32::try_from(result) {
                         note_input_file_open(fd);
                         log::info!(
-                            "[input-trace] [openat] [path {path}] [fd {fd}] [offset 0] [after_patch {}]",
+                            "[input-trace] [open] [path {path}] [fd {fd}] [offset 0] [after_patch {}]",
                             PATCH_FUNC_ENTRY_COVERED.load(Ordering::Relaxed)
                         );
                     }
@@ -440,7 +447,7 @@ fn track_input_file_syscall(
                         if state.input_fds.contains(&old_fd) {
                             let offset = input_fd_offset(&state, old_fd).unwrap_or(-1);
                             log::info!(
-                                "[input-trace] [dup2] [old_fd {old_fd}] [new_fd {new_fd}] [offset {offset}] [after_patch {}]",
+                                "[input-trace] [dup] [old_fd {old_fd}] [new_fd {new_fd}] [offset {offset}] [after_patch {}]",
                                 state.patch_func_entry_hit
                             );
                         }
@@ -459,7 +466,7 @@ fn track_input_file_syscall(
                         if state.input_fds.contains(&old_fd) {
                             let offset = input_fd_offset(&state, old_fd).unwrap_or(-1);
                             log::info!(
-                                "[input-trace] [dup3] [old_fd {old_fd}] [new_fd {new_fd}] [offset {offset}] [after_patch {}]",
+                                "[input-trace] [dup] [old_fd {old_fd}] [new_fd {new_fd}] [offset {offset}] [after_patch {}]",
                                 state.patch_func_entry_hit
                             );
                         }
@@ -501,7 +508,7 @@ fn track_input_file_syscall(
             });
         }
         SYS_CLOSE => {
-            note_input_file_close(a0 as i32);
+            note_input_file_close(a0 as i32, result);
         }
         _ => {}
     }
