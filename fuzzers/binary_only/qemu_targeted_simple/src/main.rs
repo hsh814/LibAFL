@@ -3,36 +3,53 @@ use capstone::{
 };
 use clap::Parser;
 use libafl::{
-    corpus::InMemoryCorpus,
+    corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
+    events::SimpleEventManager,
     executors::ExitKind,
-    feedbacks::CrashFeedback,
-    inputs::{Input, NopInput},
-    state::StdState,
+    feedback_or, feedback_or_fast,
+    feedbacks::{
+        custom_filename::CustomFilenameToTestcaseFeedback, Feedback, MaxMapFeedback,
+        StateInitializer, TimeFeedback,
+    },
+    fuzzer::{Fuzzer, StdFuzzer},
+    inputs::{BytesInput, HasTargetBytes, Input},
+    monitors::SimpleMonitor,
+    mutators::{havoc_mutations, scheduled::HavocScheduledMutator},
+    observers::{CanTrack, HitcountsMapObserver, TimeObserver, VariableMapObserver},
+    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
+    stages::StdMutationalStage,
+    state::{HasCorpus, HasSolutions, StdState},
 };
-use libafl_bolts::{rands::StdRand, tuples::tuple_list, Error};
+use libafl_bolts::{
+    ownedref::OwnedMutSlice, rands::StdRand, tuples::tuple_list, AsSlice, Error, Named,
+};
 use libafl_qemu::{
     capstone as qemu_capstone,
     command::{NopCommand, NopCommandManager},
     elf::EasyElf,
     modules::{
         calls::{CallTraceCollector, CallTracerModule, FullBacktraceCollector},
+        edges::StdEdgeCoverageClassicModule,
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
         EmulatorModule, RedirectStdoutModule,
     },
-    Emulator, GuestAddr, GuestUlong, GuestUsize, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
+    Emulator, GuestAddr, GuestUlong, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
     QemuExitReason, QemuShutdownCause, Regs, SYS_exit, SYS_exit_group, SyscallHookResult,
     TargetSignalHandling,
 };
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::BTreeMap,
-    env, fmt,
+    env, fmt, fs,
     io::Write,
     path::PathBuf,
     process,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
+
+use libafl_targets::{edges_map_mut_ptr, EDGES_MAP_ALLOCATED_SIZE, MAX_EDGES_FOUND};
 
 #[cfg(not(miri))]
 #[global_allocator]
@@ -50,7 +67,6 @@ struct FunctionFrame {
 #[derive(Debug, Default)]
 struct RuntimeTraceState {
     function_stack: Vec<FunctionFrame>,
-    visited_basic_blocks: BTreeMap<GuestAddr, usize>,
     target_hits: usize,
     target_unknown_hits: usize,
     target_function_calls: BTreeMap<GuestAddr, usize>,
@@ -64,14 +80,9 @@ impl RuntimeTraceState {
             return_addr: 0,
             saw_target_hit: false,
         });
-        self.visited_basic_blocks.clear();
         self.target_hits = 0;
         self.target_unknown_hits = 0;
         self.target_function_calls.clear();
-    }
-
-    fn on_basic_block_hit(&mut self, addr: GuestAddr) {
-        *self.visited_basic_blocks.entry(addr).or_insert(0) += 1;
     }
 
     fn on_call(&mut self, entry: Option<GuestAddr>, return_addr: GuestAddr) {
@@ -106,32 +117,53 @@ impl RuntimeTraceState {
             self.target_unknown_hits += 1;
         }
     }
+}
 
-    fn target_summary(&self) -> TargetSummary {
-        TargetSummary {
-            hits: self.target_hits,
-            unknown_hits: self.target_unknown_hits,
-            function_call_entries: self
-                .target_function_calls
-                .iter()
-                .map(|(addr, calls)| (*addr, *calls))
-                .collect(),
+#[derive(Debug)]
+struct TargetHitFeedback {
+    name: Cow<'static, str>,
+}
+
+impl TargetHitFeedback {
+    fn new() -> Self {
+        Self {
+            name: Cow::Borrowed("target_hit"),
         }
-    }
-
-    fn basic_block_summary(&self) -> Vec<(GuestAddr, usize)> {
-        self.visited_basic_blocks
-            .iter()
-            .map(|(addr, hits)| (*addr, *hits))
-            .collect()
     }
 }
 
-#[derive(Debug, Default, Clone)]
-struct TargetSummary {
-    hits: usize,
-    unknown_hits: usize,
-    function_call_entries: Vec<(GuestAddr, usize)>,
+impl Named for TargetHitFeedback {
+    fn name(&self) -> &Cow<'static, str> {
+        &self.name
+    }
+}
+
+impl<S> StateInitializer<S> for TargetHitFeedback {}
+
+impl<EM, I, OT, S> Feedback<EM, I, OT, S> for TargetHitFeedback {
+    fn is_interesting(
+        &mut self,
+        _state: &mut S,
+        _manager: &mut EM,
+        _input: &I,
+        _observers: &OT,
+        _exit_kind: &ExitKind,
+    ) -> Result<bool, Error> {
+        Ok(TARGET_LOC_COVERED.load(Ordering::Relaxed))
+    }
+}
+
+fn generate_reached_filename<S>(
+    state: &mut S,
+    _testcase: &mut Testcase<BytesInput>,
+) -> Result<String, Error>
+where
+    S: HasSolutions<BytesInput>,
+{
+    let reached_id = state.solutions().count_all();
+    let reached = true;
+    let is_crash = false;
+    Ok(format!("{reached_id}_{reached}_{is_crash}"))
 }
 
 std::thread_local! {
@@ -146,14 +178,6 @@ fn record_target_hit() {
     });
 }
 
-fn target_summary() -> TargetSummary {
-    RUNTIME_TRACE_STATE.with(|state| state.borrow().target_summary())
-}
-
-fn basic_block_summary() -> Vec<(GuestAddr, usize)> {
-    RUNTIME_TRACE_STATE.with(|state| state.borrow().basic_block_summary())
-}
-
 fn set_target_exec_range(range: Option<(GuestAddr, GuestAddr)>) {
     TARGET_EXEC_RANGE.with(|state| {
         *state.borrow_mut() = range;
@@ -162,12 +186,6 @@ fn set_target_exec_range(range: Option<(GuestAddr, GuestAddr)>) {
 
 fn target_exec_range() -> Option<(GuestAddr, GuestAddr)> {
     TARGET_EXEC_RANGE.with(|state| *state.borrow())
-}
-
-fn record_basic_block_hit(addr: GuestAddr) {
-    RUNTIME_TRACE_STATE.with(|state| {
-        state.borrow_mut().on_basic_block_hit(addr);
-    });
 }
 
 fn find_last_guest_frame(frames: &[GuestAddr]) -> Option<(usize, GuestAddr)> {
@@ -388,6 +406,7 @@ impl CallTraceCollector for RuntimeFunctionTracker {
     where
         I: Input,
     {
+        TARGET_LOC_COVERED.store(false, Ordering::Relaxed);
         let root_entry = _qemu.read_reg(Regs::Pc).ok().map(|pc| pc as GuestAddr);
         RUNTIME_TRACE_STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -395,7 +414,6 @@ impl CallTraceCollector for RuntimeFunctionTracker {
             if let Some(root_entry) = root_entry {
                 state.reset(root_entry);
             } else {
-                state.visited_basic_blocks.clear();
                 state.target_hits = 0;
                 state.target_unknown_hits = 0;
                 state.target_function_calls.clear();
@@ -405,48 +423,7 @@ impl CallTraceCollector for RuntimeFunctionTracker {
 }
 
 #[derive(Debug, Default)]
-struct StackTracePrinter {
-}
-
-fn on_basic_block_generated<ET, I, S>(
-    _qemu: Qemu,
-    _emulator_modules: &mut libafl_qemu::EmulatorModules<ET, I, S>,
-    _state: Option<&mut S>,
-    pc: GuestAddr,
-) -> Option<u64>
-where
-    ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
-    I: Unpin,
-    S: Unpin,
-{
-    Some(pc as u64)
-}
-
-fn on_basic_block_post_generated<ET, I, S>(
-    _qemu: Qemu,
-    _emulator_modules: &mut libafl_qemu::EmulatorModules<ET, I, S>,
-    _state: Option<&mut S>,
-    _pc: GuestAddr,
-    _block_length: GuestUsize,
-) where
-    ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
-    I: Unpin,
-    S: Unpin,
-{
-}
-
-fn on_basic_block_executed<ET, I, S>(
-    _qemu: Qemu,
-    _emulator_modules: &mut libafl_qemu::EmulatorModules<ET, I, S>,
-    _state: Option<&mut S>,
-    id: u64,
-) where
-    ET: libafl_qemu::modules::EmulatorModuleTuple<I, S>,
-    I: Unpin,
-    S: Unpin,
-{
-    record_basic_block_hit(id as GuestAddr);
-}
+struct StackTracePrinter {}
 
 fn on_target_loc_covered<ET, I, S>(
     _qemu: Qemu,
@@ -566,14 +543,16 @@ where
 #[derive(Parser, Debug)]
 #[clap(about)]
 #[command(
-    name = "qemu_stacktrace",
-    about = "A simple qemu-usermode runner that prints a stacktrace on crash or timeout"
+    name = "qemu_targeted_simple",
+    about = "A simple qemu-usermode fuzzer that collects target-hit inputs"
 )]
 struct Opts {
     #[arg(short, long, default_value = "0", value_parser = parse_guest_addr)]
     target_loc: usize,
     #[arg(short, long)]
     input: PathBuf,
+    #[arg(short, long)]
+    output: PathBuf,
 
     binary: PathBuf,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -605,59 +584,98 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .init();
 
-    log::info!("Starting qemu_stacktrace");
+    log::info!("Starting qemu_targeted_simple");
 
     let opts = Opts::parse();
     let binary = opts.binary;
     let input = opts.input;
+    let output = opts.output;
+    let seeds_dir = output.join("seeds");
+    let reached_dir = output.join("reached");
+
+    fs::create_dir_all(&seeds_dir)?;
+    fs::create_dir_all(&reached_dir)?;
+
+    let seed_copy_path = seeds_dir.join("seed_0");
+    if input != seed_copy_path {
+        fs::copy(&input, &seed_copy_path)?;
+    }
+
+    let runtime_input_path = input.clone();
+    let runtime_input_path_str = runtime_input_path.to_string_lossy().into_owned();
+    let initial_input = BytesInput::new(fs::read(&input)?);
+
     let mut elf_buf = Vec::new();
     let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
+
+    let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());
+    qemu_args.push(env::args().next().unwrap());
+    qemu_args.push(binary.to_string_lossy().into_owned());
+    qemu_args.extend(opts.target_args.into_iter().map(|arg| {
+        if arg == "@@" {
+            runtime_input_path_str.clone()
+        } else {
+            arg
+        }
+    }));
 
     let full_backtrace = unsafe { FullBacktraceCollector::new() };
     let runtime_function_tracker = RuntimeFunctionTracker::new();
     let redirect_stdout = RedirectStdoutModule::new()
         .with_stdout(suppress_guest_output)
         .with_stderr(suppress_guest_output);
+
+    let mut edges_observer = unsafe {
+        HitcountsMapObserver::new(VariableMapObserver::from_mut_slice(
+            "edges",
+            OwnedMutSlice::from_raw_parts_mut(edges_map_mut_ptr(), EDGES_MAP_ALLOCATED_SIZE),
+            &raw mut MAX_EDGES_FOUND,
+        ))
+        .track_indices()
+    };
+
     let modules = tuple_list!(
         redirect_stdout,
+        StdEdgeCoverageClassicModule::builder()
+            .map_observer(edges_observer.as_mut())
+            .build()?,
         CallTracerModule::new(
             StdAddressFilter::default(),
             tuple_list!(full_backtrace, runtime_function_tracker)
         ),
-        StackTracePrinter {
-        },
+        StackTracePrinter {},
     );
 
-    let input_path = input.to_string_lossy().into_owned();
-    let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());
-    qemu_args.push(env::args().next().unwrap());
-    qemu_args.push(binary.to_string_lossy().into_owned());
-    qemu_args.extend(opts.target_args.into_iter().map(|arg| {
-        if arg == "@@" {
-            input_path.clone()
-        } else {
-            arg
-        }
-    }));
+    let time_observer = TimeObserver::new("time");
+    let mut feedback = feedback_or!(
+        MaxMapFeedback::new(&edges_observer),
+        TimeFeedback::new(&time_observer)
+    );
+    let mut objective = feedback_or_fast!(
+        CustomFilenameToTestcaseFeedback::new(generate_reached_filename::<State>),
+        TargetHitFeedback::new()
+    );
 
-    let mut feedback = CrashFeedback::new();
-    let mut objective = CrashFeedback::new();
     let mut state = StdState::new(
         StdRand::new(),
-        InMemoryCorpus::<NopInput>::new(),
-        InMemoryCorpus::<NopInput>::new(),
+        InMemoryOnDiskCorpus::<BytesInput>::new(seeds_dir.clone())?,
+        OnDiskCorpus::<BytesInput>::new(reached_dir.clone())?,
         &mut feedback,
         &mut objective,
     )?;
 
-    type State = StdState<InMemoryCorpus<NopInput>, NopInput, StdRand, InMemoryCorpus<NopInput>>;
+    type State =
+        StdState<InMemoryOnDiskCorpus<BytesInput>, BytesInput, StdRand, OnDiskCorpus<BytesInput>>;
+
+    let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
+    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
     let mut emulator: Emulator<
         NopCommand,
         NopCommandManager,
         NopEmulatorDriver,
         _,
-        NopInput,
+        BytesInput,
         State,
         NopSnapshotManager,
     > = Emulator::empty()
@@ -704,104 +722,73 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = target_loc_runtime {
         emulator.modules_mut().instruction_function(
             addr,
-            on_target_loc_covered::<_, NopInput, State>,
+            on_target_loc_covered::<_, BytesInput, State>,
             true,
         );
     }
-    qemu.entry_break(entry);
-    emulator.first_exec(&mut state);
+
     emulator.set_target_crash_handling(&TargetSignalHandling::ReturnToHarness);
 
-    log::info!("running {} @ {entry:#x}", binary.display());
+    let monitor = SimpleMonitor::new(|s| log::info!("{s}"));
+    let mut mgr = SimpleEventManager::new(monitor);
 
-    let input = NopInput::new();
-    emulator.pre_exec(&mut state, &input);
-    let qemu_exit = unsafe { qemu.run() };
-    log::info!("exit-raw {:?}", qemu_exit);
+    let runtime_input_path_for_harness = runtime_input_path.clone();
+    let mut harness = move |emulator: &mut Emulator<_, _, _, _, _, _, _>,
+                            _state: &mut State,
+                            input: &BytesInput|
+          -> ExitKind {
+        let target = input.target_bytes();
+        fs::write(&runtime_input_path_for_harness, target.as_slice())
+            .expect("failed to update runtime input file");
 
-    let mut exit_kind = match qemu_exit {
-        Ok(QemuExitReason::Crash) => {
-            log::info!("[qemu-exit] [kind crash] [detail target crash]");
-            ExitKind::Crash
-        }
-        Ok(QemuExitReason::Timeout) => {
-            log::info!("[qemu-exit] [kind timeout] [detail execution timed out]");
-            ExitKind::Timeout
-        }
-        Ok(QemuExitReason::SyncExit) => {
-            log::info!("[qemu-exit] [kind sync exit] [detail guest requested synchronous exit]");
-            ExitKind::Ok
-        }
-        Ok(QemuExitReason::End(reason)) => {
-            log::info!(
-                "[qemu-exit] [kind end] [detail {}]",
-                shutdown_cause_detail(&reason)
-            );
-            ExitKind::Ok
-        }
-        Ok(QemuExitReason::Breakpoint(reason)) => {
-            log::info!("[qemu-exit] [kind breakpoint] [detail trigger address {reason:#x}]");
-            ExitKind::Ok
-        }
-        Err(err) => {
-            log::info!("[qemu-exit] [kind error] [detail {:?}]", err);
-            ExitKind::Crash
-        }
-    };
-    let mut observers = ();
-    emulator.post_exec(&input, &mut observers, &mut state, &mut exit_kind);
-
-    let resolver = AddressResolver::new(&qemu);
-
-    match exit_kind {
-        ExitKind::Crash => log::info!("[exit] [result crash]"),
-        ExitKind::Ok => log::info!("[exit] [result ok]"),
-        ExitKind::Timeout => log::info!("[exit] [result timeout]"),
-        other => log::info!("[exit] [result {other:?}]"),
-    }
-
-    if matches!(exit_kind, ExitKind::Crash) {
-        log::info!("stacktrace:");
-        if let Some(frames) = FullBacktraceCollector::backtrace() {
-            for (idx, addr) in frames.iter().rev().enumerate() {
-                log::info!(
-                    "[stacktrace] [idx {idx}] [addr {addr:#x}] [symbol {}]",
-                    resolver.resolve(*addr)
-                );
-            }
-            if let Some((idx, addr)) = find_last_guest_frame(&frames) {
-                log::info!(
-                    "[fault-addr] [idx {idx}] [addr {addr:#x}] [symbol {}]",
-                    resolver.resolve(addr)
-                );
-            }
-        } else {
-            log::info!("[error] no stack collected");
-        }
-    }
-
-    if let Some(addr) = target_loc_runtime {
-        let summary = target_summary();
-        log::info!(
-            "[target-cov] [location {addr:#x}] [covered {}] [hits {}]",
-            TARGET_LOC_COVERED.load(Ordering::Relaxed),
-            summary.hits
-        );
-        if summary.hits > 0 {
-            if summary.function_call_entries.is_empty() {
-                log::info!(
-                    "[target-func] [location {addr:#x}] [entry 0] [hits {}]",
-                    summary.unknown_hits
-                );
-            } else {
-                for (entry, calls) in &summary.function_call_entries {
-                    log::info!(
-                        "[target-func] [location {addr:#x}] [entry {entry:#x}] [hits {calls}]"
-                    );
+        let qemu = emulator.qemu();
+        unsafe {
+            match qemu.run() {
+                Ok(QemuExitReason::Crash) => ExitKind::Crash,
+                Ok(QemuExitReason::Timeout) => ExitKind::Timeout,
+                Ok(QemuExitReason::SyncExit) => ExitKind::Ok,
+                Ok(QemuExitReason::End(reason)) => {
+                    log::debug!("[qemu-end] [detail {}]", shutdown_cause_detail(&reason));
+                    ExitKind::Ok
+                }
+                Ok(QemuExitReason::Breakpoint(reason)) => {
+                    log::debug!("[qemu-breakpoint] [addr {reason:#x}]");
+                    ExitKind::Ok
+                }
+                Err(err) => {
+                    log::debug!("[qemu-error] [detail {:?}]", err);
+                    ExitKind::Crash
                 }
             }
         }
-    }
+    };
 
-    Ok(())
+    let timeout = std::time::Duration::from_millis(1000);
+    let mut executor = libafl_qemu::executor::QemuExecutor::new(
+        emulator,
+        &mut harness,
+        tuple_list!(edges_observer, time_observer),
+        &mut fuzzer,
+        &mut state,
+        &mut mgr,
+        timeout,
+    )?;
+
+    state.corpus_mut().add(Testcase::new(initial_input))?;
+    log::info!("Seeded corpus from {}", input.display());
+
+    let mut stages = tuple_list!(StdMutationalStage::new(HavocScheduledMutator::new(
+        havoc_mutations()
+    )),);
+
+    log::info!(
+        "running {} with seed {}",
+        binary.display(),
+        seed_copy_path.display()
+    );
+
+    match fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr) {
+        Ok(()) | Err(Error::ShuttingDown) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
