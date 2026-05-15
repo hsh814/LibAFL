@@ -814,6 +814,7 @@ impl CallTraceCollector for RuntimeFunctionTracker {
 #[derive(Debug, Default)]
 struct StackTracePrinter {
     trace_basic_blocks: bool,
+    file_trace_enabled: bool,
 }
 
 fn on_basic_block_generated<ET, I, S>(
@@ -982,7 +983,9 @@ where
                 Hook::Function(on_basic_block_executed::<ET, I, S>),
             );
         }
-        emulator_modules.post_syscalls(Hook::Function(on_input_file_syscall::<ET, I, S>));
+        if self.file_trace_enabled {
+            emulator_modules.post_syscalls(Hook::Function(on_input_file_syscall::<ET, I, S>));
+        }
         emulator_modules.crash_function(on_crash_stacktrace::<ET, I, S>);
         emulator_modules.pre_syscalls(Hook::Function(on_target_exit_syscall::<ET, I, S>));
     }
@@ -1062,6 +1065,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
         StackTracePrinter {
             trace_basic_blocks: opts.trace_basic_blocks,
+            file_trace_enabled: opts.patch_func_entry != 0,
         },
     );
 
@@ -1151,8 +1155,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => log::info!("[patch-func-entry] [set] [set false] [location 0]"),
     }
 
+    let patch_hit_runtime = patch_loc_runtime.or(patch_func_entry_runtime);
+    let file_trace_enabled = patch_func_entry_runtime.is_some();
+
     PATCH_LOC_COVERED.store(false, Ordering::Relaxed);
-    if let Some(addr) = patch_loc_runtime {
+    if let Some(addr) = patch_hit_runtime {
         emulator.modules_mut().instruction_function(
             addr,
             on_patch_loc_covered::<_, NopInput, State>,
@@ -1239,7 +1246,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(addr) = patch_loc_runtime {
+    if let Some(addr) = patch_hit_runtime {
         let summary = patch_summary();
         log::info!(
             "[patch-cov] [location {addr:#x}] [covered {}] [hits {}]",
@@ -1262,15 +1269,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(addr) = patch_func_entry_runtime {
+    if file_trace_enabled {
         let (_, open_hits, reads_before_patch, reads_after_patch) = file_trace_summary();
-        log::info!(
+        if let Some(addr) = patch_func_entry_runtime {
+            log::info!(
             "[file-trace] [summary] [location {addr:#x}] [covered {}] [open hits {}] [reads before patch {}] [reads after patch {}]",
             PATCH_FUNC_ENTRY_COVERED.load(Ordering::Relaxed),
             open_hits,
             reads_before_patch,
             reads_after_patch,
         );
+        }
         for (fd, offset) in file_fd_offset_summary() {
             let seekable = INPUT_TRACE_STATE
                 .with(|state| input_fd_seekable(&state.borrow(), fd).unwrap_or(false));
