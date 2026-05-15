@@ -28,6 +28,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fmt,
     io::Write,
+    os::unix::fs::FileTypeExt,
     path::PathBuf,
     process,
     sync::atomic::{AtomicBool, Ordering},
@@ -136,10 +137,10 @@ struct PatchSummary {
 }
 
 #[derive(Debug, Default)]
-struct InputTraceState {
-    input_path: Option<String>,
+struct FileTraceState {
     input_fds: BTreeSet<i32>,
     fd_groups: BTreeMap<i32, u64>,
+    fd_seekable: BTreeMap<i32, bool>,
     group_offsets: BTreeMap<u64, i64>,
     next_group_id: u64,
     patch_func_entry_hit: bool,
@@ -152,7 +153,7 @@ std::thread_local! {
     static RUNTIME_TRACE_STATE: RefCell<RuntimeTraceState> =
         RefCell::new(RuntimeTraceState::default());
     static TARGET_EXEC_RANGE: RefCell<Option<(GuestAddr, GuestAddr)>> = RefCell::new(None);
-    static INPUT_TRACE_STATE: RefCell<InputTraceState> = RefCell::new(InputTraceState::default());
+    static INPUT_TRACE_STATE: RefCell<FileTraceState> = RefCell::new(FileTraceState::default());
 }
 
 fn record_patch_hit() {
@@ -185,33 +186,40 @@ fn record_basic_block_hit(addr: GuestAddr) {
     });
 }
 
-fn alloc_input_group_id(state: &mut InputTraceState) -> u64 {
+fn alloc_input_group_id(state: &mut FileTraceState) -> u64 {
     let group_id = state.next_group_id;
     state.next_group_id += 1;
     group_id
 }
 
-fn input_fd_group(state: &InputTraceState, fd: i32) -> Option<u64> {
+fn input_fd_group(state: &FileTraceState, fd: i32) -> Option<u64> {
     state.fd_groups.get(&fd).copied()
 }
 
-fn input_fd_offset(state: &InputTraceState, fd: i32) -> Option<i64> {
+fn input_fd_offset(state: &FileTraceState, fd: i32) -> Option<i64> {
     let group_id = input_fd_group(state, fd)?;
     state.group_offsets.get(&group_id).copied()
 }
 
-fn update_input_fd_offset(state: &mut InputTraceState, fd: i32, new_offset: i64) {
+fn update_input_fd_offset(state: &mut FileTraceState, fd: i32, new_offset: i64) {
     if let Some(group_id) = input_fd_group(state, fd) {
         state.group_offsets.insert(group_id, new_offset);
     }
 }
 
-fn reset_input_trace_state(input_path: String) {
+fn input_fd_seekable(state: &FileTraceState, fd: i32) -> Option<bool> {
+    state.fd_seekable.get(&fd).copied()
+}
+
+fn classify_seekable_path(path: &str) -> Option<bool> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let file_type = metadata.file_type();
+    Some(file_type.is_file() || file_type.is_dir() || file_type.is_block_device())
+}
+
+fn reset_file_trace_state() {
     INPUT_TRACE_STATE.with(|state| {
-        *state.borrow_mut() = InputTraceState {
-            input_path: Some(input_path),
-            ..InputTraceState::default()
-        };
+        *state.borrow_mut() = FileTraceState::default();
     });
 }
 
@@ -222,14 +230,23 @@ fn mark_patch_func_entry_hit() {
     });
 }
 
-fn note_input_file_open(fd: i32) {
+fn note_input_file_open(fd: i32, path: String) {
     INPUT_TRACE_STATE.with(|state| {
         let mut state = state.borrow_mut();
+        let seekable = classify_seekable_path(&path).unwrap_or(false);
         state.open_hits += 1;
-        state.input_fds.insert(fd);
-        let group_id = alloc_input_group_id(&mut state);
-        state.fd_groups.insert(fd, group_id);
-        state.group_offsets.insert(group_id, 0);
+        state.fd_seekable.insert(fd, seekable);
+        if seekable {
+            state.input_fds.insert(fd);
+            let group_id = alloc_input_group_id(&mut state);
+            state.fd_groups.insert(fd, group_id);
+            state.group_offsets.insert(group_id, 0);
+        }
+        log::info!(
+            "[file-trace] [open] [path {path}] [fd {fd}] [gid {}] [offset 0] [seekable {seekable}] [after_patch {}]",
+            input_fd_group(&state, fd).unwrap_or(0),
+            PATCH_FUNC_ENTRY_COVERED.load(Ordering::Relaxed)
+        );
     });
 }
 
@@ -239,6 +256,9 @@ fn note_input_file_alias(old_fd: i32, new_fd: i32) {
         if let Some(group_id) = input_fd_group(&state, old_fd) {
             state.input_fds.insert(new_fd);
             state.fd_groups.insert(new_fd, group_id);
+            if let Some(seekable) = input_fd_seekable(&state, old_fd) {
+                state.fd_seekable.insert(new_fd, seekable);
+            }
         }
     });
 }
@@ -249,17 +269,24 @@ fn note_input_file_close(fd: i32, result: GuestUlong) {
         if state.input_fds.contains(&fd) {
             let offset = input_fd_offset(&state, fd).unwrap_or(-1);
             log::info!(
-                "[input-trace] [close] [fd {fd}] [offset {offset}] [result {result}] [after_patch {}]",
+                "[file-trace] [close] [fd {fd}] [gid {}] [offset {offset}] [result {result}] [after_patch {}]",
+                input_fd_group(&state, fd).unwrap_or(0),
                 state.patch_func_entry_hit
             );
         }
         if let Some(group_id) = state.fd_groups.remove(&fd) {
             state.input_fds.remove(&fd);
-            if !state
+            state.fd_seekable.remove(&fd);
+            let still_alive = state
                 .fd_groups
                 .values()
-                .any(|existing_group| *existing_group == group_id)
-            {
+                .any(|existing_group| *existing_group == group_id);
+            if !still_alive {
+                log::info!(
+                    "[file-trace] [group-close] [gid {}] [after_patch {}]",
+                    group_id,
+                    state.patch_func_entry_hit
+                );
                 state.group_offsets.remove(&group_id);
             }
         }
@@ -274,12 +301,16 @@ fn note_input_file_lseek(fd: i32, offset: i64, whence: i32, result: GuestUlong) 
                 let new_offset = result as i64;
                 update_input_fd_offset(&mut state, fd, new_offset);
                 log::info!(
-                    "[input-trace] [lseek] [fd {fd}] [offset {offset}] [whence {whence}] [new_offset {new_offset}] [succ true] [after_patch {}]",
+                    "[file-trace] [lseek] [fd {fd}] [gid {}] [offset {offset}] [whence {whence}] [new_offset {new_offset}] [seekable {}] [succ true] [after_patch {}]",
+                    input_fd_group(&state, fd).unwrap_or(0),
+                    input_fd_seekable(&state, fd).unwrap_or(false),
                     state.patch_func_entry_hit
                 );
             } else {
                 log::info!(
-                    "[input-trace] [lseek] [fd {fd}] [offset {offset}] [whence {whence}] [new_offset {result}] [succ false] [after_patch {}]",
+                    "[file-trace] [lseek] [fd {fd}] [gid {}] [offset {offset}] [whence {whence}] [new_offset {result}] [seekable {}] [succ false] [after_patch {}]",
+                    input_fd_group(&state, fd).unwrap_or(0),
+                    input_fd_seekable(&state, fd).unwrap_or(false),
                     state.patch_func_entry_hit
                 );
             }
@@ -287,7 +318,7 @@ fn note_input_file_lseek(fd: i32, offset: i64, whence: i32, result: GuestUlong) 
     });
 }
 
-fn note_input_file_read(fd: i32, bytes_read: usize) {
+fn note_input_file_read(fd: i32, bytes_read: usize, advances_offset: bool) {
     if bytes_read == 0 {
         return;
     }
@@ -297,7 +328,7 @@ fn note_input_file_read(fd: i32, bytes_read: usize) {
         if !state.input_fds.contains(&fd) {
             return;
         }
-        if bytes_read > 0 {
+        if advances_offset {
             if let Some(current_offset) = input_fd_offset(&state, fd) {
                 let next_offset = current_offset.saturating_add(bytes_read as i64);
                 update_input_fd_offset(&mut state, fd, next_offset);
@@ -311,11 +342,18 @@ fn note_input_file_read(fd: i32, bytes_read: usize) {
     });
 }
 
-fn input_trace_summary() -> (Option<String>, bool, usize, usize, usize) {
+fn syscall_succeeded(result: GuestUlong) -> bool {
+    match core::mem::size_of::<GuestUlong>() {
+        4 => (result as u32 as i32) >= 0,
+        8 => (result as u64 as i64) >= 0,
+        _ => unreachable!(),
+    }
+}
+
+fn file_trace_summary() -> (bool, usize, usize, usize) {
     INPUT_TRACE_STATE.with(|state| {
         let state = state.borrow();
         (
-            state.input_path.clone(),
             state.patch_func_entry_hit,
             state.open_hits,
             state.reads_before_patch,
@@ -324,7 +362,7 @@ fn input_trace_summary() -> (Option<String>, bool, usize, usize, usize) {
     })
 }
 
-fn input_fd_offset_summary() -> Vec<(i32, i64)> {
+fn file_fd_offset_summary() -> Vec<(i32, i64)> {
     INPUT_TRACE_STATE.with(|state| {
         let state = state.borrow();
         state
@@ -349,23 +387,22 @@ fn read_guest_cstring(qemu: Qemu, addr: GuestAddr) -> Option<String> {
     String::from_utf8(bytes[..nul].to_vec()).ok()
 }
 
-fn track_input_file_syscall(
+fn track_file_syscall(
     qemu: Qemu,
     syscall: i32,
     result: GuestUlong,
     a0: GuestUlong,
     a1: GuestUlong,
     a2: GuestUlong,
-    a3: GuestUlong,
+    _a3: GuestUlong,
 ) {
-    let Some(input_path) = INPUT_TRACE_STATE.with(|state| state.borrow().input_path.clone()) else {
+    if !syscall_succeeded(result) {
         return;
-    };
-
+    }
     const SYS_OPEN: i32 = libc::SYS_open as i32;
     const SYS_OPENAT: i32 = libc::SYS_openat as i32;
     const SYS_READ: i32 = libc::SYS_read as i32;
-    const SYS_PREAD64: i32 = libc::SYS_pread64 as i32;
+    // const SYS_PREAD64: i32 = libc::SYS_pread64 as i32;
     const SYS_CLOSE: i32 = libc::SYS_close as i32;
     const SYS_LSEEK: i32 = libc::SYS_lseek as i32;
     const SYS_DUP: i32 = libc::SYS_dup as i32;
@@ -377,42 +414,32 @@ fn track_input_file_syscall(
     match syscall {
         SYS_OPEN => {
             if let Some(path) = read_guest_cstring(qemu, a0 as GuestAddr) {
-                if path == input_path {
-                    if let Ok(fd) = i32::try_from(result) {
-                        note_input_file_open(fd);
-                        log::info!(
-                            "[input-trace] [open] [path {path}] [fd {fd}] [offset 0] [after_patch {}]",
-                            PATCH_FUNC_ENTRY_COVERED.load(Ordering::Relaxed)
-                        );
-                    }
+                if let Ok(fd) = i32::try_from(result) {
+                    note_input_file_open(fd, path);
                 }
             }
         }
         SYS_OPENAT => {
             if let Some(path) = read_guest_cstring(qemu, a1 as GuestAddr) {
-                if path == input_path {
-                    if let Ok(fd) = i32::try_from(result) {
-                        note_input_file_open(fd);
-                        log::info!(
-                            "[input-trace] [open] [path {path}] [fd {fd}] [offset 0] [after_patch {}]",
-                            PATCH_FUNC_ENTRY_COVERED.load(Ordering::Relaxed)
-                        );
-                    }
+                if let Ok(fd) = i32::try_from(result) {
+                    note_input_file_open(fd, path);
                 }
             }
         }
         SYS_READ => {
             let fd = a0 as i32;
-            note_input_file_read(fd, result as usize);
+            note_input_file_read(fd, result as usize, true);
             INPUT_TRACE_STATE.with(|state| {
-                let state = state.borrow();
-                if state.patch_func_entry_hit && state.input_fds.contains(&fd) && result != 0 {
-                    let offset = input_fd_offset(&state, fd).unwrap_or(-1);
-                    log::info!(
-                        "[input-trace] [read] [syscall {syscall}] [fd {fd}] [offset {offset}] [bytes {result}] [after_patch true]"
-                    );
-                }
-            });
+                    let state = state.borrow();
+                    if state.patch_func_entry_hit && state.input_fds.contains(&fd) {
+                        let offset = input_fd_offset(&state, fd).unwrap_or(-1);
+                        log::info!(
+                            "[file-trace] [read] [syscall {syscall}] [fd {fd}] [gid {}] [offset {offset}] [seekable {}] [bytes {result}] [after_patch true]",
+                            input_fd_group(&state, fd).unwrap_or(0),
+                            input_fd_seekable(&state, fd).unwrap_or(false)
+                        );
+                    }
+                });
         }
         SYS_LSEEK => {
             let fd = a0 as i32;
@@ -429,7 +456,9 @@ fn track_input_file_syscall(
                     if state.input_fds.contains(&old_fd) {
                         let offset = input_fd_offset(&state, old_fd).unwrap_or(-1);
                         log::info!(
-                            "[input-trace] [dup] [old_fd {old_fd}] [new_fd {new_fd}] [offset {offset}] [after_patch {}]",
+                            "[file-trace] [dup] [old_fd {old_fd}] [new_fd {new_fd}] [gid {}] [offset {offset}] [seekable {}] [after_patch {}]",
+                            input_fd_group(&state, old_fd).unwrap_or(0),
+                            input_fd_seekable(&state, old_fd).unwrap_or(false),
                             state.patch_func_entry_hit
                         );
                     }
@@ -447,7 +476,9 @@ fn track_input_file_syscall(
                         if state.input_fds.contains(&old_fd) {
                             let offset = input_fd_offset(&state, old_fd).unwrap_or(-1);
                             log::info!(
-                                "[input-trace] [dup] [old_fd {old_fd}] [new_fd {new_fd}] [offset {offset}] [after_patch {}]",
+                                "[file-trace] [dup] [old_fd {old_fd}] [new_fd {new_fd}] [gid {}] [offset {offset}] [seekable {}] [after_patch {}]",
+                                input_fd_group(&state, old_fd).unwrap_or(0),
+                                input_fd_seekable(&state, old_fd).unwrap_or(false),
                                 state.patch_func_entry_hit
                             );
                         }
@@ -466,7 +497,9 @@ fn track_input_file_syscall(
                         if state.input_fds.contains(&old_fd) {
                             let offset = input_fd_offset(&state, old_fd).unwrap_or(-1);
                             log::info!(
-                                "[input-trace] [dup] [old_fd {old_fd}] [new_fd {new_fd}] [offset {offset}] [after_patch {}]",
+                                "[file-trace] [dup] [old_fd {old_fd}] [new_fd {new_fd}] [gid {}] [offset {offset}] [seekable {}] [after_patch {}]",
+                                input_fd_group(&state, old_fd).unwrap_or(0),
+                                input_fd_seekable(&state, old_fd).unwrap_or(false),
                                 state.patch_func_entry_hit
                             );
                         }
@@ -485,7 +518,9 @@ fn track_input_file_syscall(
                         if state.input_fds.contains(&fd) {
                             let offset = input_fd_offset(&state, fd).unwrap_or(-1);
                             log::info!(
-                                "[input-trace] [fcntl-dup] [fd {fd}] [cmd {cmd}] [new_fd {new_fd}] [offset {offset}] [after_patch {}]",
+                                "[file-trace] [fcntl-dup] [fd {fd}] [cmd {cmd}] [new_fd {new_fd}] [gid {}] [offset {offset}] [seekable {}] [after_patch {}]",
+                                input_fd_group(&state, fd).unwrap_or(0),
+                                input_fd_seekable(&state, fd).unwrap_or(false),
                                 state.patch_func_entry_hit
                             );
                         }
@@ -493,22 +528,25 @@ fn track_input_file_syscall(
                 }
             }
         }
-        SYS_PREAD64 => {
-            let fd = a0 as i32;
-            let requested_offset = a3 as i64;
-            note_input_file_read(fd, result as usize);
-            INPUT_TRACE_STATE.with(|state| {
-                let state = state.borrow();
-                if state.patch_func_entry_hit && state.input_fds.contains(&fd) && result != 0 {
-                    let current_offset = input_fd_offset(&state, fd).unwrap_or(-1);
-                    log::info!(
-                        "[input-trace] [pread64] [syscall {syscall}] [fd {fd}] [offset {current_offset}] [requested_offset {requested_offset}] [bytes {result}] [after_patch true]"
-                    );
-                }
-            });
-        }
+        // PREAD64 does not change file offset
+        // SYS_PREAD64 => {
+        //     let fd = a0 as i32;
+        //     let requested_offset = a3 as i64;
+        //     note_input_file_read(fd, result as usize, false);
+        //     INPUT_TRACE_STATE.with(|state| {
+        //         let state = state.borrow();
+        //         if state.patch_func_entry_hit && state.input_fds.contains(&fd) && result != 0 {
+        //             let current_offset = input_fd_offset(&state, fd).unwrap_or(-1);
+        //             log::info!(
+        //                 "[file-trace] [pread64] [syscall {syscall}] [fd {fd}] [gid {}] [offset {current_offset}] [requested_offset {requested_offset}] [bytes {result}] [after_patch true]",
+        //                 input_fd_group(&state, fd).unwrap_or(0)
+        //             );
+        //         }
+        //     });
+        // }
         SYS_CLOSE => {
-            note_input_file_close(a0 as i32, result);
+            let fd = a0 as i32;
+            note_input_file_close(fd, result);
         }
         _ => {}
     }
@@ -535,7 +573,7 @@ where
     I: Unpin,
     S: Unpin,
 {
-    track_input_file_syscall(qemu, syscall, result, a0, a1, a2, a3);
+    track_file_syscall(qemu, syscall, result, a0, a1, a2, a3);
     result
 }
 
@@ -1007,7 +1045,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let binary = opts.binary;
     let input = opts.input;
     let input_path = input.to_string_lossy().into_owned();
-    reset_input_trace_state(input_path.clone());
+    reset_file_trace_state();
     let mut elf_buf = Vec::new();
     let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
 
@@ -1225,18 +1263,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(addr) = patch_func_entry_runtime {
-        let (tracked_input_path, _, open_hits, reads_before_patch, reads_after_patch) =
-            input_trace_summary();
+        let (_, open_hits, reads_before_patch, reads_after_patch) = file_trace_summary();
         log::info!(
-            "[patch-func-entry] [info] [location {addr:#x}] [covered {}] [input-path {}] [open hits {}] [reads before patch {}] [reads after patch {}]",
+            "[file-trace] [summary] [location {addr:#x}] [covered {}] [open hits {}] [reads before patch {}] [reads after patch {}]",
             PATCH_FUNC_ENTRY_COVERED.load(Ordering::Relaxed),
-            tracked_input_path.as_deref().unwrap_or("<unset>"),
             open_hits,
             reads_before_patch,
             reads_after_patch,
         );
-        for (fd, offset) in input_fd_offset_summary() {
-            log::info!("[patch-func-entry] [fd] [fd {fd}] [offset {offset}]");
+        for (fd, offset) in file_fd_offset_summary() {
+            let seekable = INPUT_TRACE_STATE
+                .with(|state| input_fd_seekable(&state.borrow(), fd).unwrap_or(false));
+            log::info!("[file-trace] [fd {fd}] [offset {offset}] [seekable {seekable}]");
         }
     }
 
