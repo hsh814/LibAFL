@@ -732,7 +732,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let monitor = SimpleMonitor::new(|s| log::info!("{s}"));
     let mut mgr = SimpleEventManager::new(monitor);
 
-    let runtime_input_path_for_harness = runtime_input_path.clone();
+    let runtime_input_path_for_harness = output.join(".cur_input");
     let mut harness = move |emulator: &mut Emulator<_, _, _, _, _, _, _>,
                             _state: &mut State,
                             input: &BytesInput|
