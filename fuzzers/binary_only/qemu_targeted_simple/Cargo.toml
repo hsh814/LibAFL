@@ -21,3 +21,4 @@ libafl_qemu = { path = "../../../crates/libafl_qemu", features = ["usermode", "x
 libafl_targets = { path = "../../../crates/libafl_targets" }
 log = { version = "0.4.22", features = ["release_max_level_info"] }
 mimalloc = "0.1.48"
+serde = { version = "1", features = ["derive"] }

@@ -3,6 +3,7 @@ use capstone::{
 };
 use clap::Parser;
 use libafl::{
+    common::HasMetadata,
     corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
     events::SimpleEventManager,
     executors::ExitKind,
@@ -39,23 +40,28 @@ use libafl_qemu::{
 };
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     env, fmt, fs,
     io::Write,
     path::PathBuf,
     process,
-    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
 use libafl_targets::{edges_map_mut_ptr, EDGES_MAP_ALLOCATED_SIZE, MAX_EDGES_FOUND};
+use serde::{Deserialize, Serialize};
 
 #[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-static TARGET_LOC_COVERED: AtomicBool = AtomicBool::new(false);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReachedMetadata {
+    is_crash: bool,
+}
+
+libafl_bolts::impl_serdeany!(ReachedMetadata);
 
 #[derive(Debug, Clone, Copy)]
 struct FunctionFrame {
@@ -119,6 +125,14 @@ impl RuntimeTraceState {
     }
 }
 
+std::thread_local! {
+    static RUNTIME_TRACE_STATE: RefCell<RuntimeTraceState> =
+        RefCell::new(RuntimeTraceState::default());
+    static TARGET_EXEC_RANGE: RefCell<Option<(GuestAddr, GuestAddr)>> = RefCell::new(None);
+    static TARGET_LOC_COVERED: Cell<bool> = const { Cell::new(false) };
+    static LAST_RUN_IS_CRASH: Cell<bool> = const { Cell::new(false) };
+}
+
 #[derive(Debug)]
 struct TargetHitFeedback {
     name: Cow<'static, str>,
@@ -149,27 +163,24 @@ impl<EM, I, OT, S> Feedback<EM, I, OT, S> for TargetHitFeedback {
         _observers: &OT,
         _exit_kind: &ExitKind,
     ) -> Result<bool, Error> {
-        Ok(TARGET_LOC_COVERED.load(Ordering::Relaxed))
+        TARGET_LOC_COVERED.with(|state| Ok(state.get()))
     }
 }
 
 fn generate_reached_filename<S>(
     state: &mut S,
-    _testcase: &mut Testcase<BytesInput>,
+    testcase: &mut Testcase<BytesInput>,
 ) -> Result<String, Error>
 where
-    S: HasSolutions<BytesInput>,
+    S: HasSolutions<BytesInput> + HasMetadata,
 {
     let reached_id = state.solutions().count_all();
-    let reached = true;
-    let is_crash = false;
+    let reached = TARGET_LOC_COVERED.with(Cell::get);
+    let is_crash = LAST_RUN_IS_CRASH.with(Cell::get);
+    testcase
+        .metadata_map_mut()
+        .insert(ReachedMetadata { is_crash });
     Ok(format!("{reached_id}_{reached}_{is_crash}"))
-}
-
-std::thread_local! {
-    static RUNTIME_TRACE_STATE: RefCell<RuntimeTraceState> =
-        RefCell::new(RuntimeTraceState::default());
-    static TARGET_EXEC_RANGE: RefCell<Option<(GuestAddr, GuestAddr)>> = RefCell::new(None);
 }
 
 fn record_target_hit() {
@@ -406,7 +417,9 @@ impl CallTraceCollector for RuntimeFunctionTracker {
     where
         I: Input,
     {
-        TARGET_LOC_COVERED.store(false, Ordering::Relaxed);
+        TARGET_LOC_COVERED.with(|state| {
+            state.set(false);
+        });
         let root_entry = _qemu.read_reg(Regs::Pc).ok().map(|pc| pc as GuestAddr);
         RUNTIME_TRACE_STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -435,7 +448,9 @@ fn on_target_loc_covered<ET, I, S>(
     I: Unpin,
     S: Unpin,
 {
-    TARGET_LOC_COVERED.store(true, Ordering::Relaxed);
+    TARGET_LOC_COVERED.with(|state| {
+        state.set(true);
+    });
     record_target_hit();
 }
 
@@ -718,7 +733,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => log::info!("[target-info] [set false] [location 0]"),
     }
 
-    TARGET_LOC_COVERED.store(false, Ordering::Relaxed);
+    TARGET_LOC_COVERED.with(|state| {
+        state.set(false);
+    });
     if let Some(addr) = target_loc_runtime {
         emulator.modules_mut().instruction_function(
             addr,
@@ -743,7 +760,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let qemu = emulator.qemu();
         unsafe {
-            match qemu.run() {
+            let exit_kind = match qemu.run() {
                 Ok(QemuExitReason::Crash) => ExitKind::Crash,
                 Ok(QemuExitReason::Timeout) => ExitKind::Timeout,
                 Ok(QemuExitReason::SyncExit) => ExitKind::Ok,
@@ -759,7 +776,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     log::debug!("[qemu-error] [detail {:?}]", err);
                     ExitKind::Crash
                 }
-            }
+            };
+
+            LAST_RUN_IS_CRASH.with(|state| state.set(matches!(exit_kind, ExitKind::Crash)));
+            exit_kind
         }
     };
 
