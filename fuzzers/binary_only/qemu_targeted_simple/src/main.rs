@@ -3,7 +3,7 @@ use capstone::{
 };
 use clap::Parser;
 use libafl::{
-    common::HasMetadata,
+    common::{HasMetadata, HasNamedMetadata},
     corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
     events::SimpleEventManager,
     executors::ExitKind,
@@ -19,7 +19,7 @@ use libafl::{
     observers::{CanTrack, HitcountsMapObserver, TimeObserver, VariableMapObserver},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
     stages::StdMutationalStage,
-    state::{HasCorpus, HasSolutions, StdState},
+    state::{HasCorpus, HasExecutions, HasSolutions, StdState},
 };
 use libafl_bolts::{
     ownedref::OwnedMutSlice, rands::StdRand, tuples::tuple_list, AsSlice, Error, Named,
@@ -59,6 +59,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReachedMetadata {
     is_crash: bool,
+    crash_saved_count: usize,
+    noncrash_saved_count: usize,
 }
 
 libafl_bolts::impl_serdeany!(ReachedMetadata);
@@ -131,39 +133,82 @@ std::thread_local! {
     static TARGET_EXEC_RANGE: RefCell<Option<(GuestAddr, GuestAddr)>> = RefCell::new(None);
     static TARGET_LOC_COVERED: Cell<bool> = const { Cell::new(false) };
     static LAST_RUN_IS_CRASH: Cell<bool> = const { Cell::new(false) };
+    static SAVED_CRASH_COUNT: Cell<usize> = const { Cell::new(0) };
+    static SAVED_NONCRASH_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Debug)]
-struct TargetHitFeedback {
+struct TargetHitFeedback<F> {
     name: Cow<'static, str>,
+    coverage_feedback: F,
 }
 
-impl TargetHitFeedback {
-    fn new() -> Self {
+impl<F> TargetHitFeedback<F> {
+    fn new(coverage_feedback: F) -> Self {
         Self {
             name: Cow::Borrowed("target_hit"),
+            coverage_feedback,
         }
     }
 }
 
-impl Named for TargetHitFeedback {
+impl<F> Named for TargetHitFeedback<F> {
     fn name(&self) -> &Cow<'static, str> {
         &self.name
     }
 }
 
-impl<S> StateInitializer<S> for TargetHitFeedback {}
+impl<F, S> StateInitializer<S> for TargetHitFeedback<F>
+where
+    F: StateInitializer<S>,
+{
+    fn init_state(&mut self, state: &mut S) -> Result<(), Error> {
+        self.coverage_feedback.init_state(state)
+    }
+}
 
-impl<EM, I, OT, S> Feedback<EM, I, OT, S> for TargetHitFeedback {
+impl<EM, I, OT, S, F> Feedback<EM, I, OT, S> for TargetHitFeedback<F>
+where
+    F: Feedback<EM, I, OT, S>,
+    S: HasNamedMetadata + HasExecutions,
+{
     fn is_interesting(
         &mut self,
-        _state: &mut S,
-        _manager: &mut EM,
-        _input: &I,
-        _observers: &OT,
-        _exit_kind: &ExitKind,
+        state: &mut S,
+        manager: &mut EM,
+        input: &I,
+        observers: &OT,
+        exit_kind: &ExitKind,
     ) -> Result<bool, Error> {
-        TARGET_LOC_COVERED.with(|state| Ok(state.get()))
+        let covered = TARGET_LOC_COVERED.with(Cell::get);
+        if !covered {
+            return Ok(false);
+        }
+
+        let is_crash = LAST_RUN_IS_CRASH.with(Cell::get);
+        let saved_count = if is_crash {
+            SAVED_CRASH_COUNT.with(Cell::get)
+        } else {
+            SAVED_NONCRASH_COUNT.with(Cell::get)
+        };
+
+        if saved_count < 64 {
+            return Ok(true);
+        }
+
+        self.coverage_feedback
+            .is_interesting(state, manager, input, observers, exit_kind)
+    }
+
+    fn append_metadata(
+        &mut self,
+        state: &mut S,
+        manager: &mut EM,
+        observers: &OT,
+        testcase: &mut Testcase<I>,
+    ) -> Result<(), Error> {
+        self.coverage_feedback
+            .append_metadata(state, manager, observers, testcase)
     }
 }
 
@@ -177,9 +222,26 @@ where
     let reached_id = state.solutions().count_all();
     let reached = TARGET_LOC_COVERED.with(Cell::get);
     let is_crash = LAST_RUN_IS_CRASH.with(Cell::get);
-    testcase
-        .metadata_map_mut()
-        .insert(ReachedMetadata { is_crash });
+    let (crash_saved_count, noncrash_saved_count) = if is_crash {
+        let next = SAVED_CRASH_COUNT.with(|count| {
+            let next = count.get().saturating_add(1);
+            count.set(next);
+            next
+        });
+        (next, SAVED_NONCRASH_COUNT.with(Cell::get))
+    } else {
+        let next = SAVED_NONCRASH_COUNT.with(|count| {
+            let next = count.get().saturating_add(1);
+            count.set(next);
+            next
+        });
+        (SAVED_CRASH_COUNT.with(Cell::get), next)
+    };
+    testcase.metadata_map_mut().insert(ReachedMetadata {
+        is_crash,
+        crash_saved_count,
+        noncrash_saved_count,
+    });
     Ok(format!("{reached_id}_{reached}_{is_crash}"))
 }
 
@@ -668,7 +730,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut objective = feedback_or_fast!(
         CustomFilenameToTestcaseFeedback::new(generate_reached_filename::<State>),
-        TargetHitFeedback::new()
+        TargetHitFeedback::new(MaxMapFeedback::with_name("edges_target", &edges_observer))
     );
 
     let mut state = StdState::new(
