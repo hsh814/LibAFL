@@ -40,6 +40,7 @@ use crate::{
 pub struct AsanGuestModule<F> {
     env: Vec<(String, String)>,
     filter: F,
+    enabled: bool,
     asan_lib: Option<String>,
     asan_mappings: Option<Vec<MapInfo>>,
 }
@@ -102,6 +103,18 @@ where
         Self {
             env: env.to_vec(),
             filter,
+            enabled: true,
+            asan_lib: None,
+            asan_mappings: None,
+        }
+    }
+
+    #[must_use]
+    pub fn disabled(env: &[(String, String)], filter: F) -> Self {
+        Self {
+            env: env.to_vec(),
+            filter,
+            enabled: false,
             asan_lib: None,
             asan_mappings: None,
         }
@@ -202,6 +215,9 @@ where
     ) where
         ET: EmulatorModuleTuple<I, S>,
     {
+        if !self.enabled {
+            return;
+        }
         let mut args = qemu_params.to_cli();
 
         // Let the use skip preloading the ASAN DSO. Maybe they want to use
@@ -296,6 +312,9 @@ where
         I: Unpin,
         S: Unpin,
     {
+        if !self.enabled {
+            return;
+        }
         let mappings = qemu.mappings().collect::<Vec<MapInfo>>();
         for mapping in &mappings {
             log::info!("mapping: {mapping:}");

@@ -1,15 +1,35 @@
 # qemu_stacktrace
 A simple executor that runs a binary in qemu and collects data required for binradar.
 
+## Dependencies
+
+The ASAN guest DSO must be built before use:
+
+```bash
+cd ../../../crates/libafl_qemu/libafl_qemu_asan && \
+ARCH=x86_64 PROFILE=release just build
+```
+
+Then set `CUSTOM_LIBAFL_QEMU_ASAN_PATH` to point to the built `libafl_qemu_asan_guest.so`:
+
+```bash
+export CUSTOM_LIBAFL_QEMU_ASAN_PATH=/path/to/libafl_qemu_asan_guest.so
+```
+
 ## Usage
 ```bash
 cargo build --release
-./target/release/qemu_stacktrace --input /path/to/poc/input --patch-loc 0x456845 ./buggy.bin -- --options --for --guest-binary @@
+./target/release/qemu_stacktrace --input /path/to/poc/input --patch-loc 0x456845 --asan-guest ./buggy.bin -- -l @@
 ```
-- `--input` specifies the path to the input file that will be used as an argument for the guest binary.
-- `--patch-loc` specifies the address of the instruction to be patched in the guest binary.
-- `./buggy.bin` is the path to the guest binary that will be executed in qemu.
-- `--options --for --guest-binary` are the options that will be passed to the guest binary. The `@@` will be replaced with the path to the input file specified by `--input`.
+
+### Options
+- `--input <PATH>` — Path to the input file used as an argument for the guest binary.
+- `--patch-loc <ADDR>` — Address of the instruction to be patched in the guest binary.
+- `--asan-guest` — Enable QEMU ASAN guest mode for the target binary.
+- `--asan-include <RANGE>` — Restrict ASAN instrumentation to the given address range(s). Repeatable. Format: `0x400000-0x500000`.
+- `--asan-exclude <RANGE>` — Exclude address range(s) from ASAN instrumentation. Repeatable. Mutually exclusive with `--asan-include`.
+- `--trace-basic-blocks` — Log every basic block executed.
+- `./buggy.bin` — Path to the guest binary. `@@` in trailing args is replaced with the input path.
 
 ## Output
 ```python

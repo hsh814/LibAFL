@@ -12,22 +12,21 @@ use libafl::{
 use libafl_bolts::{rands::StdRand, tuples::tuple_list, Error};
 use libafl_qemu::{
     capstone as qemu_capstone,
-    command::{NopCommand, NopCommandManager},
     elf::EasyElf,
     modules::{
         calls::{CallTraceCollector, CallTracerModule, FullBacktraceCollector},
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
-        EmulatorModule, RedirectStdoutModule,
+        AsanGuestModule, EmulatorModule, RedirectStdoutModule,
     },
-    Emulator, GuestAddr, GuestUlong, GuestUsize, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
-    QemuExitReason, QemuShutdownCause, Regs, SYS_exit, SYS_exit_group, SyscallHookResult,
-    TargetSignalHandling,
+    Emulator, GuestAddr, GuestUlong, GuestUsize, Hook, Qemu, QemuExitReason, QemuShutdownCause,
+    Regs, SYS_exit, SYS_exit_group, SyscallHookResult, TargetSignalHandling,
 };
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env, fmt,
     io::Write,
+    ops::Range,
     os::unix::fs::FileTypeExt,
     path::PathBuf,
     process,
@@ -38,6 +37,8 @@ use std::{
 #[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+type State = StdState<InMemoryCorpus<NopInput>, NopInput, StdRand, InMemoryCorpus<NopInput>>;
 
 static PATCH_LOC_COVERED: AtomicBool = AtomicBool::new(false);
 static PATCH_FUNC_ENTRY_COVERED: AtomicBool = AtomicBool::new(false);
@@ -613,6 +614,8 @@ fn shutdown_cause_detail(cause: &QemuShutdownCause) -> String {
     }
 }
 
+
+
 fn suppress_guest_output(_: &[u8]) {}
 
 struct RuntimeFunctionTracker {
@@ -914,6 +917,21 @@ where
     SyscallHookResult::Run
 }
 
+fn parse_asan_range(value: &str) -> Result<Range<GuestAddr>, String> {
+    let trimmed = value.trim();
+    let (start_str, end_str) = trimmed.split_once('-').ok_or_else(|| {
+        format!("invalid range '{value}': expected format start-end (e.g. 0x400000-0x500000)")
+    })?;
+    let start = parse_guest_addr(start_str)?;
+    let end = parse_guest_addr(end_str)?;
+    if start >= end {
+        return Err(format!(
+            "invalid range '{value}': start ({start:#x}) >= end ({end:#x})"
+        ));
+    }
+    Ok(Range { start, end })
+}
+
 fn parse_guest_addr(value: &str) -> Result<GuestAddr, String> {
     let trimmed = value.trim();
     let parsed = if let Some(hex) = trimmed.strip_prefix("0x") {
@@ -1008,6 +1026,13 @@ struct Opts {
     patch_func_entry: usize,
 
     #[arg(long)]
+    asan_guest: bool,
+    #[arg(long = "asan-include", value_parser = parse_asan_range)]
+    asan_include: Vec<Range<GuestAddr>>,
+    #[arg(long = "asan-exclude", value_parser = parse_asan_range)]
+    asan_exclude: Vec<Range<GuestAddr>>,
+
+    #[arg(long)]
     trace_basic_blocks: bool,
     #[arg(short, long)]
     input: PathBuf,
@@ -1052,22 +1077,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut elf_buf = Vec::new();
     let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
 
-    let full_backtrace = unsafe { FullBacktraceCollector::new() };
-    let runtime_function_tracker = RuntimeFunctionTracker::new();
-    let redirect_stdout = RedirectStdoutModule::new()
-        .with_stdout(suppress_guest_output)
-        .with_stderr(suppress_guest_output);
-    let modules = tuple_list!(
-        redirect_stdout,
-        CallTracerModule::new(
-            StdAddressFilter::default(),
-            tuple_list!(full_backtrace, runtime_function_tracker)
-        ),
-        StackTracePrinter {
-            trace_basic_blocks: opts.trace_basic_blocks,
-            file_trace_enabled: opts.patch_func_entry != 0,
-        },
-    );
+    let env = env::vars()
+        .filter(|(k, _v)| k != "LD_LIBRARY_PATH")
+        .collect::<Vec<(String, String)>>();
 
     let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());
     qemu_args.push(env::args().next().unwrap());
@@ -1090,17 +1102,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &mut objective,
     )?;
 
-    type State = StdState<InMemoryCorpus<NopInput>, NopInput, StdRand, InMemoryCorpus<NopInput>>;
+    let patch_loc = opts.patch_loc;
+    let patch_func_entry = opts.patch_func_entry;
 
-    let mut emulator: Emulator<
-        NopCommand,
-        NopCommandManager,
-        NopEmulatorDriver,
-        _,
-        NopInput,
-        State,
-        NopSnapshotManager,
-    > = Emulator::empty()
+    let stacktrace_printer = StackTracePrinter {
+        trace_basic_blocks: opts.trace_basic_blocks,
+        file_trace_enabled: patch_func_entry != 0,
+    };
+
+    let full_backtrace = unsafe { FullBacktraceCollector::new() };
+    let runtime_function_tracker = RuntimeFunctionTracker::new();
+
+    let asan_filter = if !opts.asan_include.is_empty() {
+        StdAddressFilter::allow_list(opts.asan_include)
+    } else if !opts.asan_exclude.is_empty() {
+        StdAddressFilter::deny_list(opts.asan_exclude)
+    } else {
+        StdAddressFilter::default()
+    };
+
+    let asan_guest = if opts.asan_guest {
+        log::info!("[asan-guest] [enabled true]");
+        AsanGuestModule::new(&env, asan_filter)
+    } else {
+        log::info!("[asan-guest] [enabled false]");
+        AsanGuestModule::disabled(&env, asan_filter)
+    };
+
+    let modules = tuple_list!(
+        RedirectStdoutModule::new()
+            .with_stdout(suppress_guest_output)
+            .with_stderr(suppress_guest_output),
+        asan_guest,
+        CallTracerModule::new(
+            StdAddressFilter::default(),
+            tuple_list!(full_backtrace, runtime_function_tracker)
+        ),
+        stacktrace_printer,
+    );
+
+    let mut emulator = Emulator::empty()
         .qemu_parameters(qemu_args)
         .modules(modules)
         .build()?;
@@ -1125,7 +1166,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
     set_target_exec_range(target_exec_range);
 
-    let patch_loc = opts.patch_loc;
     let patch_loc_runtime: Option<usize> = if patch_loc != 0 {
         if elf.is_pic() {
             Some(load_addr + patch_loc)
@@ -1140,7 +1180,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => log::info!("[patch-info] [set false] [location 0]"),
     }
 
-    let patch_func_entry = opts.patch_func_entry;
     let patch_func_entry_runtime: Option<usize> = if patch_func_entry != 0 {
         if elf.is_pic() {
             Some(load_addr + patch_func_entry)

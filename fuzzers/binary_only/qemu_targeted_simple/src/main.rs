@@ -32,7 +32,7 @@ use libafl_qemu::{
         calls::{CallTraceCollector, CallTracerModule, FullBacktraceCollector},
         edges::StdEdgeCoverageClassicModule,
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
-        EmulatorModule, RedirectStdoutModule,
+        AsanGuestModule, EmulatorModule, RedirectStdoutModule,
     },
     Emulator, GuestAddr, GuestUlong, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
     QemuExitReason, QemuShutdownCause, Regs, SYS_exit, SYS_exit_group, SyscallHookResult,
@@ -44,6 +44,7 @@ use std::{
     collections::BTreeMap,
     env, fmt, fs,
     io::Write,
+    ops::Range,
     path::PathBuf,
     process,
     time::Instant,
@@ -546,6 +547,21 @@ where
     SyscallHookResult::Run
 }
 
+fn parse_asan_range(value: &str) -> Result<Range<GuestAddr>, String> {
+    let trimmed = value.trim();
+    let (start_str, end_str) = trimmed.split_once('-').ok_or_else(|| {
+        format!("invalid range '{value}': expected format start-end (e.g. 0x400000-0x500000)")
+    })?;
+    let start = parse_guest_addr(start_str)?;
+    let end = parse_guest_addr(end_str)?;
+    if start >= end {
+        return Err(format!(
+            "invalid range '{value}': start ({start:#x}) >= end ({end:#x})"
+        ));
+    }
+    Ok(Range { start, end })
+}
+
 fn parse_guest_addr(value: &str) -> Result<GuestAddr, String> {
     let trimmed = value.trim();
     let parsed = if let Some(hex) = trimmed.strip_prefix("0x") {
@@ -631,6 +647,13 @@ struct Opts {
     #[arg(short, long)]
     output: PathBuf,
 
+    #[arg(long)]
+    asan_guest: bool,
+    #[arg(long = "asan-include", value_parser = parse_asan_range)]
+    asan_include: Vec<Range<GuestAddr>>,
+    #[arg(long = "asan-exclude", value_parser = parse_asan_range)]
+    asan_exclude: Vec<Range<GuestAddr>>,
+
     binary: PathBuf,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     target_args: Vec<String>,
@@ -685,6 +708,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut elf_buf = Vec::new();
     let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
 
+    let env = env::vars()
+        .filter(|(k, _v)| k != "LD_LIBRARY_PATH")
+        .collect::<Vec<(String, String)>>();
+
     let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());
     qemu_args.push(env::args().next().unwrap());
     qemu_args.push(binary.to_string_lossy().into_owned());
@@ -702,6 +729,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_stdout(suppress_guest_output)
         .with_stderr(suppress_guest_output);
 
+    let asan_filter = if !opts.asan_include.is_empty() {
+        StdAddressFilter::allow_list(opts.asan_include)
+    } else if !opts.asan_exclude.is_empty() {
+        StdAddressFilter::deny_list(opts.asan_exclude)
+    } else {
+        StdAddressFilter::default()
+    };
+
+    let asan_guest = if opts.asan_guest {
+        log::info!("[asan-guest] [enabled true]");
+        AsanGuestModule::new(&env, asan_filter)
+    } else {
+        log::info!("[asan-guest] [enabled false]");
+        AsanGuestModule::disabled(&env, asan_filter)
+    };
+
     let mut edges_observer = unsafe {
         HitcountsMapObserver::new(VariableMapObserver::from_mut_slice(
             "edges",
@@ -716,6 +759,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         StdEdgeCoverageClassicModule::builder()
             .map_observer(edges_observer.as_mut())
             .build()?,
+        asan_guest,
         CallTracerModule::new(
             StdAddressFilter::default(),
             tuple_list!(full_backtrace, runtime_function_tracker)
