@@ -98,6 +98,3 @@ log
 
 # Coredumps
 *.core
-
-# Agent files
-AGENTS.md
