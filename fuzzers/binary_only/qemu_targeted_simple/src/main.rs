@@ -647,8 +647,8 @@ struct Opts {
     #[arg(short, long)]
     output: PathBuf,
 
-    #[arg(long)]
-    asan_guest: bool,
+    #[arg(long, default_value_t = false)]
+    no_asan: bool,
     #[arg(long = "asan-include", value_parser = parse_asan_range)]
     asan_include: Vec<Range<GuestAddr>>,
     #[arg(long = "asan-exclude", value_parser = parse_asan_range)]
@@ -737,12 +737,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         StdAddressFilter::default()
     };
 
-    let asan_guest = if opts.asan_guest {
-        log::info!("[asan-guest] [enabled true]");
-        AsanGuestModule::new(&env, asan_filter)
-    } else {
+    let asan_guest = if opts.no_asan {
         log::info!("[asan-guest] [enabled false]");
         AsanGuestModule::disabled(&env, asan_filter)
+    } else {
+        log::info!("[asan-guest] [enabled true]");
+        AsanGuestModule::new(&env, asan_filter)
     };
 
     let mut edges_observer = unsafe {
@@ -849,6 +849,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             true,
         );
     }
+
+    qemu.entry_break(entry);
 
     emulator.set_target_crash_handling(&TargetSignalHandling::ReturnToHarness);
 
