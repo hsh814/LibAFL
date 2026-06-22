@@ -9,9 +9,9 @@ use which::which;
 
 use crate::cargo_add_rpath;
 
-pub const LIBAFL_QEMU_GIT_URL: &str = "https://github.com/AFLplusplus/qemu-libafl-bridge";
+pub const LIBAFL_QEMU_GIT_URL: &str = "https://github.com/hsh814/qemu-libafl-bridge";
 pub const LIBAFL_QEMU_DIRNAME: &str = "qemu-libafl-bridge";
-pub const LIBAFL_QEMU_GIT_REV: &str = "d7a6067ffc94fbb4caad409d390e099630b71941";
+pub const LIBAFL_QEMU_GIT_REV: &str = "e59e855a0c9962a49b03e5e56665cc2a595fde4e";
 
 pub struct BuildResult {
     pub qemu_path: PathBuf,
