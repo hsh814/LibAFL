@@ -1067,7 +1067,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .init();
 
-    log::info!("Starting qemu_stacktrace");
+    // Prevent 900GB core dumps from ASAN shadow mappings
+    unsafe {
+        let rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_CORE, &rlim);
+    }
 
     let opts = Opts::parse();
     let binary = opts.binary;
