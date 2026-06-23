@@ -614,8 +614,6 @@ fn shutdown_cause_detail(cause: &QemuShutdownCause) -> String {
     }
 }
 
-
-
 fn suppress_guest_output(_: &[u8]) {}
 
 struct RuntimeFunctionTracker {
