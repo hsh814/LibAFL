@@ -387,7 +387,7 @@ where
             // Skip registration if we already have a hook at this address.
             if !emulator_modules
                 .get_mut::<Self>()
-                .map_or(true, |h| h.registered_call_addrs.insert(call_addr))
+                .is_none_or(|h| h.registered_call_addrs.insert(call_addr))
             {
                 continue;
             }
@@ -421,7 +421,7 @@ where
             // Skip registration if we already have a hook at this address.
             if !emulator_modules
                 .get_mut::<Self>()
-                .map_or(true, |h| h.registered_ret_addrs.insert(ret_addr))
+                .is_none_or(|h| h.registered_ret_addrs.insert(ret_addr))
             {
                 continue;
             }
