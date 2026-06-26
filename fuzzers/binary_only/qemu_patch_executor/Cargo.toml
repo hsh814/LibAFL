@@ -17,6 +17,6 @@ env_logger = { version = "0.11.5" }
 libc = "0.2"
 libafl = { path = "../../../crates/libafl" }
 libafl_bolts = { path = "../../../crates/libafl_bolts", features = ["errors_backtrace"] }
-libafl_qemu = { path = "../../../crates/libafl_qemu", features = ["usermode", "x86_64"] }
+libafl_qemu = { path = "../../../crates/libafl_qemu", features = ["usermode", "x86_64", "asan_rust"] }
 log = { version = "0.4.22", features = ["release_max_level_info"] }
 mimalloc = "0.1.48"

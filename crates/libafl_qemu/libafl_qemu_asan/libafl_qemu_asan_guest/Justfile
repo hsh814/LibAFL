@@ -115,6 +115,7 @@ strip_guest: link_guest
     	--strip-unneeded \
     	-o {{ TARGET_DIR }}/$CROSS_TARGET/{{ PROFILE_DIR }}/libafl_qemu_asan_guest.so \
     	{{ TARGET_DIR }}/$CROSS_TARGET/{{ PROFILE_DIR }}/_libafl_qemu_asan_guest.so
+    cp {{ TARGET_DIR }}/$CROSS_TARGET/{{ PROFILE_DIR }}/libafl_qemu_asan_guest.so {{ TARGET_DIR }}/
 
 [unix]
 build_guest: strip_guest

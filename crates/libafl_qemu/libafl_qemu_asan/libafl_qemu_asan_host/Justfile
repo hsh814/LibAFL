@@ -116,6 +116,7 @@ strip_host: link_host
     	--strip-unneeded \
     	-o {{ TARGET_DIR }}/$CROSS_TARGET/{{ PROFILE_DIR }}/libafl_qemu_asan_host.so \
     	{{ TARGET_DIR }}/$CROSS_TARGET/{{ PROFILE_DIR }}/_libafl_qemu_asan_host.so
+    cp {{ TARGET_DIR }}/$CROSS_TARGET/{{ PROFILE_DIR }}/libafl_qemu_asan_host.so {{ TARGET_DIR }}/
 
 [unix]
 build_host: strip_host

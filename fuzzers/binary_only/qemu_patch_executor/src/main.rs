@@ -17,7 +17,7 @@ use libafl_qemu::{
     modules::{
         calls::{CallTraceCollector, CallTracerModule, FullBacktraceCollector},
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
-        EmulatorModule, RedirectStdoutModule,
+        AsanHostModule, EmulatorModule, RedirectStdoutModule,
     },
     Emulator, GuestAddr, GuestUlong, GuestUsize, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
     QemuExitReason, QemuShutdownCause, Regs, SYS_exit, SYS_exit_group, SyscallHookResult,
@@ -26,7 +26,7 @@ use libafl_qemu::{
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    env, fmt,
+    env, fmt, fs,
     io::Write,
     os::unix::fs::FileTypeExt,
     path::PathBuf,
@@ -35,9 +35,9 @@ use std::{
     time::Instant,
 };
 
-#[cfg(not(miri))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// #[cfg(not(miri))]
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 static PATCH_LOC_COVERED: AtomicBool = AtomicBool::new(false);
 static PATCH_FUNC_ENTRY_COVERED: AtomicBool = AtomicBool::new(false);
@@ -1051,6 +1051,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     reset_file_trace_state();
     let mut elf_buf = Vec::new();
     let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
+    let env = env::vars()
+        .filter(|(k, _v)| k != "LD_LIBRARY_PATH")
+        .collect::<Vec<(String, String)>>();
+    
+    let pid = std::process::id();
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))?;
+    log::info!("{}", maps);
 
     let full_backtrace = unsafe { FullBacktraceCollector::new() };
     let runtime_function_tracker = RuntimeFunctionTracker::new();
@@ -1067,6 +1074,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             trace_basic_blocks: opts.trace_basic_blocks,
             file_trace_enabled: opts.patch_func_entry != 0,
         },
+        unsafe { AsanHostModule::builder().env(&env).filter(StdAddressFilter::default()).asan_report().build() }
     );
 
     let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());

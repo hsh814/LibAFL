@@ -1,7 +1,7 @@
 use capstone::{
     arch::x86::X86OperandType, arch::BuildsCapstone, arch::DetailsArchInsn, Capstone, RegId,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use libafl::{
     corpus::InMemoryCorpus,
     executors::ExitKind,
@@ -16,7 +16,7 @@ use libafl_qemu::{
     modules::{
         calls::{CallTraceCollector, CallTracerModule, FullBacktraceCollector},
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
-        AsanGuestModule, EmulatorModule, RedirectStdoutModule,
+        AsanGuestModule, AsanHostModule, EmulatorModule, EmulatorModuleTuple, RedirectStdoutModule,
     },
     Emulator, GuestAddr, GuestUlong, GuestUsize, Hook, Qemu, QemuExitReason, QemuShutdownCause,
     Regs, SYS_exit, SYS_exit_group, SyscallHookResult, TargetSignalHandling,
@@ -28,20 +28,27 @@ use std::{
     io::Write,
     ops::Range,
     os::unix::fs::FileTypeExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
-#[cfg(not(miri))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// #[cfg(not(miri))]
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 type State = StdState<InMemoryCorpus<NopInput>, NopInput, StdRand, InMemoryCorpus<NopInput>>;
 
 static PATCH_LOC_COVERED: AtomicBool = AtomicBool::new(false);
 static PATCH_FUNC_ENTRY_COVERED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AsanMode {
+    Guest,
+    Host,
+    None,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct FunctionFrame {
@@ -1023,8 +1030,8 @@ struct Opts {
     #[arg(long, default_value = "0", value_parser = parse_guest_addr)]
     patch_func_entry: usize,
 
-    #[arg(long, default_value_t = false)]
-    no_asan: bool,
+    #[arg(long, value_enum, default_value_t = AsanMode::Host)]
+    asan: AsanMode,
     #[arg(long = "asan-include", value_parser = parse_asan_range)]
     asan_include: Vec<Range<GuestAddr>>,
     #[arg(long = "asan-exclude", value_parser = parse_asan_range)]
@@ -1040,112 +1047,18 @@ struct Opts {
     target_args: Vec<String>,
 }
 
-fn main() {
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(err) = run() {
-            eprintln!("error: {err}");
-            process::exit(1);
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        panic!("qemu-user and libafl_qemu is only supported on linux!");
-    }
-}
-
 #[cfg(target_os = "linux")]
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = Instant::now();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(move |buf, record| {
-            let elapsed = start_time.elapsed().as_millis();
-            writeln!(buf, "{} [time {}]", record.args(), elapsed)
-        })
-        .init();
-
-    // Prevent 900GB core dumps from ASAN shadow mappings
-    unsafe {
-        let rlim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        libc::setrlimit(libc::RLIMIT_CORE, &rlim);
-    }
-
-    let opts = Opts::parse();
-    let binary = opts.binary;
-    let input = opts.input;
-    let input_path = input.to_string_lossy().into_owned();
-    reset_file_trace_state();
-    let mut elf_buf = Vec::new();
-    let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
-
-    let env = env::vars()
-        .filter(|(k, _v)| k != "LD_LIBRARY_PATH")
-        .collect::<Vec<(String, String)>>();
-
-    let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());
-    qemu_args.push(env::args().next().unwrap());
-    qemu_args.push(binary.to_string_lossy().into_owned());
-    qemu_args.extend(opts.target_args.into_iter().map(|arg| {
-        if arg == "@@" {
-            input_path.clone()
-        } else {
-            arg
-        }
-    }));
-
-    let mut feedback = CrashFeedback::new();
-    let mut objective = CrashFeedback::new();
-    let mut state = StdState::new(
-        StdRand::new(),
-        InMemoryCorpus::<NopInput>::new(),
-        InMemoryCorpus::<NopInput>::new(),
-        &mut feedback,
-        &mut objective,
-    )?;
-
-    let patch_loc = opts.patch_loc;
-    let patch_func_entry = opts.patch_func_entry;
-
-    let stacktrace_printer = StackTracePrinter {
-        trace_basic_blocks: opts.trace_basic_blocks,
-        file_trace_enabled: patch_func_entry != 0,
-    };
-
-    let full_backtrace = unsafe { FullBacktraceCollector::new() };
-    let runtime_function_tracker = RuntimeFunctionTracker::new();
-
-    let asan_filter = if !opts.asan_include.is_empty() {
-        StdAddressFilter::allow_list(opts.asan_include)
-    } else if !opts.asan_exclude.is_empty() {
-        StdAddressFilter::deny_list(opts.asan_exclude)
-    } else {
-        StdAddressFilter::default()
-    };
-
-    let asan_guest = if opts.no_asan {
-        log::info!("[asan-guest] [enabled false]");
-        AsanGuestModule::disabled(&env, asan_filter)
-    } else {
-        log::info!("[asan-guest] [enabled true]");
-        AsanGuestModule::new(&env, asan_filter)
-    };
-
-    let modules = tuple_list!(
-        RedirectStdoutModule::new()
-            .with_stdout(suppress_guest_output)
-            .with_stderr(suppress_guest_output),
-        asan_guest,
-        CallTracerModule::new(
-            StdAddressFilter::default(),
-            tuple_list!(full_backtrace, runtime_function_tracker)
-        ),
-        stacktrace_printer,
-    );
-
+fn run_with_modules<ET>(
+    modules: ET,
+    state: &mut State,
+    opts: &Opts,
+    binary: &Path,
+    elf: &EasyElf<'_>,
+    qemu_args: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    ET: EmulatorModuleTuple<NopInput, State>,
+{
     let mut emulator = Emulator::empty()
         .qemu_parameters(qemu_args)
         .modules(modules)
@@ -1171,11 +1084,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
     set_target_exec_range(target_exec_range);
 
-    let patch_loc_runtime: Option<usize> = if patch_loc != 0 {
+    let patch_loc_runtime: Option<usize> = if opts.patch_loc != 0 {
         if elf.is_pic() {
-            Some(load_addr + patch_loc)
+            Some(load_addr + opts.patch_loc)
         } else {
-            Some(patch_loc)
+            Some(opts.patch_loc)
         }
     } else {
         None
@@ -1185,11 +1098,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => log::info!("[patch-info] [set false] [location 0]"),
     }
 
-    let patch_func_entry_runtime: Option<usize> = if patch_func_entry != 0 {
+    let patch_func_entry_runtime: Option<usize> = if opts.patch_func_entry != 0 {
         if elf.is_pic() {
-            Some(load_addr + patch_func_entry)
+            Some(load_addr + opts.patch_func_entry)
         } else {
-            Some(patch_func_entry)
+            Some(opts.patch_func_entry)
         }
     } else {
         None
@@ -1206,7 +1119,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = patch_hit_runtime {
         emulator.modules_mut().instruction_function(
             addr,
-            on_patch_loc_covered::<_, NopInput, State>,
+            on_patch_loc_covered::<ET, NopInput, State>,
             true,
         );
     }
@@ -1214,18 +1127,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = patch_func_entry_runtime {
         emulator.modules_mut().instruction_function(
             addr,
-            on_patch_func_entry_covered::<_, NopInput, State>,
+            on_patch_func_entry_covered::<ET, NopInput, State>,
             true,
         );
     }
     qemu.entry_break(entry);
-    emulator.first_exec(&mut state);
+    emulator.first_exec(state);
     emulator.set_target_crash_handling(&TargetSignalHandling::ReturnToHarness);
 
     log::info!("running {} @ {entry:#x}", binary.display());
 
     let input = NopInput::new();
-    emulator.pre_exec(&mut state, &input);
+    emulator.pre_exec(state, &input);
     let qemu_exit = unsafe { qemu.run() };
     log::info!("exit-raw {:?}", qemu_exit);
 
@@ -1259,7 +1172,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut observers = ();
-    emulator.post_exec(&input, &mut observers, &mut state, &mut exit_kind);
+    emulator.post_exec(&input, &mut observers, state, &mut exit_kind);
 
     let resolver = AddressResolver::new(&qemu);
 
@@ -1340,4 +1253,168 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn main() {
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(err) = run() {
+            eprintln!("error: {err}");
+            process::exit(1);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        panic!("qemu-user and libafl_qemu is only supported on linux!");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let start_time = Instant::now();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(move |buf, record| {
+            let elapsed = start_time.elapsed().as_millis();
+            writeln!(buf, "{} [time {}]", record.args(), elapsed)
+        })
+        .init();
+
+    // Prevent 900GB core dumps from ASAN shadow mappings
+    unsafe {
+        let rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_CORE, &rlim);
+    }
+
+    let opts = Opts::parse();
+    let binary = &opts.binary;
+    let input_path = opts.input.clone().to_string_lossy().into_owned();
+    reset_file_trace_state();
+    let mut elf_buf = Vec::new();
+    let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
+
+    let env = env::vars()
+        .filter(|(k, _v)| k != "LD_LIBRARY_PATH")
+        .collect::<Vec<(String, String)>>();
+
+    let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());
+    qemu_args.push(env::args().next().unwrap());
+    qemu_args.push(binary.to_string_lossy().into_owned());
+    qemu_args.extend(opts.target_args.clone().into_iter().map(|arg| {
+        if arg == "@@" {
+            input_path.clone()
+        } else {
+            arg
+        }
+    }));
+
+    let mut feedback = CrashFeedback::new();
+    let mut objective = CrashFeedback::new();
+    let mut state = StdState::new(
+        StdRand::new(),
+        InMemoryCorpus::<NopInput>::new(),
+        InMemoryCorpus::<NopInput>::new(),
+        &mut feedback,
+        &mut objective,
+    )?;
+
+    let asan_filter = if !opts.asan_include.is_empty() {
+        StdAddressFilter::allow_list(opts.asan_include.clone())
+    } else if !opts.asan_exclude.is_empty() {
+        StdAddressFilter::deny_list(opts.asan_exclude.clone())
+    } else {
+        StdAddressFilter::default()
+    };
+
+    match opts.asan {
+        AsanMode::Guest => {
+            log::info!("[asan] [mode guest]");
+            run_with_modules(
+                tuple_list!(
+                    RedirectStdoutModule::new()
+                        .with_stdout(suppress_guest_output)
+                        .with_stderr(suppress_guest_output),
+                    CallTracerModule::new(
+                        StdAddressFilter::default(),
+                        tuple_list!(
+                            unsafe { FullBacktraceCollector::new() },
+                            RuntimeFunctionTracker::new()
+                        ),
+                    ),
+                    StackTracePrinter {
+                        trace_basic_blocks: opts.trace_basic_blocks,
+                        file_trace_enabled: opts.patch_func_entry != 0,
+                    },
+                    AsanGuestModule::new(&env, asan_filter),
+                ),
+                &mut state,
+                &opts,
+                &binary,
+                &elf,
+                qemu_args,
+            )
+        }
+        AsanMode::Host => {
+            log::info!("[asan] [mode host]");
+            run_with_modules(
+                tuple_list!(
+                    RedirectStdoutModule::new()
+                        .with_stdout(suppress_guest_output)
+                        .with_stderr(suppress_guest_output),
+                    CallTracerModule::new(
+                        StdAddressFilter::default(),
+                        tuple_list!(
+                            unsafe { FullBacktraceCollector::new() },
+                            RuntimeFunctionTracker::new()
+                        ),
+                    ),
+                    StackTracePrinter {
+                        trace_basic_blocks: opts.trace_basic_blocks,
+                        file_trace_enabled: opts.patch_func_entry != 0,
+                    },
+                    unsafe {
+                        AsanHostModule::builder()
+                            .env(&env)
+                            .filter(asan_filter)
+                            .asan_report()
+                            .build()
+                    },
+                ),
+                &mut state,
+                &opts,
+                &binary,
+                &elf,
+                qemu_args,
+            )
+        }
+        AsanMode::None => {
+            log::info!("[asan] [mode none]");
+            run_with_modules(
+                tuple_list!(
+                    RedirectStdoutModule::new()
+                        .with_stdout(suppress_guest_output)
+                        .with_stderr(suppress_guest_output),
+                    CallTracerModule::new(
+                        StdAddressFilter::default(),
+                        tuple_list!(
+                            unsafe { FullBacktraceCollector::new() },
+                            RuntimeFunctionTracker::new()
+                        ),
+                    ),
+                    StackTracePrinter {
+                        trace_basic_blocks: opts.trace_basic_blocks,
+                        file_trace_enabled: opts.patch_func_entry != 0,
+                    },
+                ),
+                &mut state,
+                &opts,
+                &binary,
+                &elf,
+                qemu_args,
+            )
+        }
+    }
 }
