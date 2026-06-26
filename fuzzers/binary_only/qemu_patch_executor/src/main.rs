@@ -1,7 +1,7 @@
 use capstone::{
     arch::x86::X86OperandType, arch::BuildsCapstone, arch::DetailsArchInsn, Capstone, RegId,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use libafl::{
     corpus::InMemoryCorpus,
     executors::ExitKind,
@@ -17,7 +17,7 @@ use libafl_qemu::{
     modules::{
         calls::{CallTraceCollector, CallTracerModule, FullBacktraceCollector},
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
-        AsanHostModule, EmulatorModule, RedirectStdoutModule,
+        AsanHostModule, AsanGuestModule, EmulatorModule, RedirectStdoutModule,
     },
     Emulator, GuestAddr, GuestUlong, GuestUsize, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
     QemuExitReason, QemuShutdownCause, Regs, SYS_exit, SYS_exit_group, SyscallHookResult,
@@ -41,6 +41,13 @@ use std::{
 
 static PATCH_LOC_COVERED: AtomicBool = AtomicBool::new(false);
 static PATCH_FUNC_ENTRY_COVERED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AsanMode {
+    Guest,
+    Host,
+    None,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct FunctionFrame {
@@ -1007,6 +1014,9 @@ struct Opts {
     #[arg(long, default_value = "0", value_parser = parse_guest_addr)]
     patch_func_entry: usize,
 
+    #[arg(long, value_enum, default_value_t = AsanMode::Host)]
+    asan: AsanMode,
+
     #[arg(long)]
     trace_basic_blocks: bool,
     #[arg(short, long)]
@@ -1063,7 +1073,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_function_tracker = RuntimeFunctionTracker::new();
     let redirect_stdout = RedirectStdoutModule::new()
         .with_stdout(suppress_guest_output)
-        .with_stderr(suppress_guest_output);
+        .with_stderr(suppress_guest_output);    
     let modules = tuple_list!(
         redirect_stdout,
         CallTracerModule::new(

@@ -1,7 +1,7 @@
 use capstone::{
     arch::x86::X86OperandType, arch::BuildsCapstone, arch::DetailsArchInsn, Capstone, RegId,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use libafl::{
     common::{HasMetadata, HasNamedMetadata},
     corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
@@ -32,7 +32,7 @@ use libafl_qemu::{
         calls::{CallTraceCollector, CallTracerModule, FullBacktraceCollector},
         edges::StdEdgeCoverageClassicModule,
         utils::{addr2line::AddressResolver, filters::StdAddressFilter},
-        AsanGuestModule, EmulatorModule, RedirectStdoutModule,
+        AsanGuestModule, AsanHostModule, EmulatorModule, EmulatorModuleTuple, RedirectStdoutModule,
     },
     Emulator, GuestAddr, GuestUlong, Hook, NopEmulatorDriver, NopSnapshotManager, Qemu,
     QemuExitReason, QemuShutdownCause, Regs, SYS_exit, SYS_exit_group, SyscallHookResult,
@@ -45,7 +45,7 @@ use std::{
     env, fmt, fs,
     io::Write,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     time::Instant,
 };
@@ -53,9 +53,9 @@ use std::{
 use libafl_targets::{edges_map_mut_ptr, EDGES_MAP_ALLOCATED_SIZE, MAX_EDGES_FOUND};
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(miri))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// #[cfg(not(miri))]
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReachedMetadata {
@@ -65,6 +65,13 @@ struct ReachedMetadata {
 }
 
 libafl_bolts::impl_serdeany!(ReachedMetadata);
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AsanMode {
+    Guest,
+    Host,
+    None,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct FunctionFrame {
@@ -125,6 +132,205 @@ impl RuntimeTraceState {
         } else {
             self.target_unknown_hits += 1;
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_fuzzer<ET>(
+    asan_tail: ET,
+    opts: &Opts,
+    binary: &Path,
+    elf: &EasyElf<'_>,
+    qemu_args: Vec<String>,
+    seeds_dir: PathBuf,
+    reached_dir: PathBuf,
+    output: PathBuf,
+    runtime_input_path: PathBuf,
+    initial_input: BytesInput,
+    seed_copy_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    ET: EmulatorModuleTuple<BytesInput, State>,
+{
+    let mut edges_observer = unsafe {
+        HitcountsMapObserver::new(VariableMapObserver::from_mut_slice(
+            "edges",
+            OwnedMutSlice::from_raw_parts_mut(edges_map_mut_ptr(), EDGES_MAP_ALLOCATED_SIZE),
+            &raw mut MAX_EDGES_FOUND,
+        ))
+        .track_indices()
+    };
+
+    let edge_module = StdEdgeCoverageClassicModule::builder()
+        .map_observer(edges_observer.as_mut())
+        .build()?;
+
+    let full_backtrace = unsafe { FullBacktraceCollector::new() };
+    let runtime_function_tracker = RuntimeFunctionTracker::new();
+    let call_tracer = CallTracerModule::new(
+        StdAddressFilter::default(),
+        tuple_list!(full_backtrace, runtime_function_tracker),
+    );
+
+    let redirect_stdout = RedirectStdoutModule::new()
+        .with_stdout(suppress_guest_output)
+        .with_stderr(suppress_guest_output);
+
+    let stack_trace_printer = StackTracePrinter {};
+
+    let modules = (
+        redirect_stdout,
+        (edge_module, (call_tracer, (stack_trace_printer, asan_tail))),
+    );
+
+    let time_observer = TimeObserver::new("time");
+    let mut feedback = feedback_or!(
+        MaxMapFeedback::new(&edges_observer),
+        TimeFeedback::new(&time_observer)
+    );
+    let mut objective = feedback_or_fast!(
+        CustomFilenameToTestcaseFeedback::new(generate_reached_filename::<State>),
+        TargetHitFeedback::new(MaxMapFeedback::with_name("edges_target", &edges_observer))
+    );
+
+    let mut state = StdState::new(
+        StdRand::new(),
+        InMemoryOnDiskCorpus::<BytesInput>::new(seeds_dir.clone())?,
+        OnDiskCorpus::<BytesInput>::new(reached_dir.clone())?,
+        &mut feedback,
+        &mut objective,
+    )?;
+
+    let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
+    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
+
+    let mut emulator: Emulator<
+        NopCommand,
+        NopCommandManager,
+        NopEmulatorDriver,
+        _,
+        BytesInput,
+        State,
+        NopSnapshotManager,
+    > = Emulator::empty()
+        .qemu_parameters(qemu_args)
+        .modules(modules)
+        .build()?;
+
+    let qemu = emulator.qemu();
+    let load_addr = qemu.load_addr();
+    let entry = elf
+        .entry_point(if elf.is_pic() { load_addr } else { 0 })
+        .ok_or_else(|| {
+            Box::new(Error::illegal_argument(format!(
+                "could not determine ELF entry point for {}",
+                binary.display()
+            ))) as Box<dyn std::error::Error>
+        })?;
+    log::info!("[entry] [address {entry:#x}]");
+
+    let entry_addr = entry as GuestAddr;
+    let target_exec_range = qemu.mappings().find_map(|map| {
+        let start = map.start() as GuestAddr;
+        let end = map.end() as GuestAddr;
+        (start <= entry_addr && entry_addr < end).then_some((start, end))
+    });
+    set_target_exec_range(target_exec_range);
+
+    let target_loc = opts.target_loc;
+    let target_loc_runtime: Option<usize> = if target_loc != 0 {
+        if elf.is_pic() {
+            Some(load_addr + target_loc)
+        } else {
+            Some(target_loc)
+        }
+    } else {
+        None
+    };
+    match target_loc_runtime {
+        Some(addr) => log::info!("[target-info] [set true] [location {addr:#x}]"),
+        None => log::info!("[target-info] [set false] [location 0]"),
+    }
+
+    TARGET_LOC_COVERED.with(|state| {
+        state.set(false);
+    });
+    if let Some(addr) = target_loc_runtime {
+        emulator.modules_mut().instruction_function(
+            addr,
+            on_target_loc_covered::<_, BytesInput, State>,
+            true,
+        );
+    }
+
+    qemu.entry_break(entry);
+
+    emulator.set_target_crash_handling(&TargetSignalHandling::ReturnToHarness);
+
+    let monitor = SimpleMonitor::new(|s| log::info!("{s}"));
+    let mut mgr = SimpleEventManager::new(monitor);
+
+    let runtime_input_path_for_harness = output.join(".cur_input");
+    let mut harness = move |emulator: &mut Emulator<_, _, _, _, _, _, _>,
+                            _state: &mut State,
+                            input: &BytesInput|
+          -> ExitKind {
+        let target = input.target_bytes();
+        fs::write(&runtime_input_path_for_harness, target.as_slice())
+            .expect("failed to update runtime input file");
+
+        let qemu = emulator.qemu();
+        unsafe {
+            let exit_kind = match qemu.run() {
+                Ok(QemuExitReason::Crash) => ExitKind::Crash,
+                Ok(QemuExitReason::Timeout) => ExitKind::Timeout,
+                Ok(QemuExitReason::SyncExit) => ExitKind::Ok,
+                Ok(QemuExitReason::End(reason)) => {
+                    log::debug!("[qemu-end] [detail {}]", shutdown_cause_detail(&reason));
+                    ExitKind::Ok
+                }
+                Ok(QemuExitReason::Breakpoint(reason)) => {
+                    log::debug!("[qemu-breakpoint] [addr {reason:#x}]");
+                    ExitKind::Ok
+                }
+                Err(err) => {
+                    log::debug!("[qemu-error] [detail {:?}]", err);
+                    ExitKind::Crash
+                }
+            };
+
+            LAST_RUN_IS_CRASH.with(|state| state.set(matches!(exit_kind, ExitKind::Crash)));
+            exit_kind
+        }
+    };
+
+    let timeout = std::time::Duration::from_millis(1000);
+    let mut executor = libafl_qemu::executor::QemuExecutor::new(
+        emulator,
+        &mut harness,
+        tuple_list!(edges_observer, time_observer),
+        &mut fuzzer,
+        &mut state,
+        &mut mgr,
+        timeout,
+    )?;
+
+    state.corpus_mut().add(Testcase::new(initial_input))?;
+    log::info!("Seeded corpus from {}", runtime_input_path.display());
+
+    let mut stages = tuple_list!(StdMutationalStage::new(HavocScheduledMutator::new(
+        havoc_mutations()
+    )),);
+
+    log::info!(
+        "running {} with seed {}",
+        binary.display(),
+        seed_copy_path.display()
+    );
+
+    match fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr) {
+        Ok(()) | Err(Error::ShuttingDown) => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -647,8 +853,8 @@ struct Opts {
     #[arg(short, long)]
     output: PathBuf,
 
-    #[arg(long, default_value_t = false)]
-    no_asan: bool,
+    #[arg(long, value_enum, default_value_t = AsanMode::Host)]
+    asan: AsanMode,
     #[arg(long = "asan-include", value_parser = parse_asan_range)]
     asan_include: Vec<Range<GuestAddr>>,
     #[arg(long = "asan-exclude", value_parser = parse_asan_range)]
@@ -658,6 +864,9 @@ struct Opts {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     target_args: Vec<String>,
 }
+
+type State =
+    StdState<InMemoryOnDiskCorpus<BytesInput>, BytesInput, StdRand, OnDiskCorpus<BytesInput>>;
 
 fn main() {
     #[cfg(target_os = "linux")]
@@ -694,9 +903,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let opts = Opts::parse();
-    let binary = opts.binary;
-    let input = opts.input;
-    let output = opts.output;
+    let binary = &opts.binary;
+    let input = &opts.input;
+    let output = &opts.output;
     let seeds_dir = output.join("seeds");
     let reached_dir = output.join("reached");
 
@@ -704,16 +913,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&reached_dir)?;
 
     let seed_copy_path = seeds_dir.join("seed_0");
-    if input != seed_copy_path {
-        fs::copy(&input, &seed_copy_path)?;
+    if *input != seed_copy_path {
+        fs::copy(input, &seed_copy_path)?;
     }
 
     let runtime_input_path = input.clone();
     let runtime_input_path_str = runtime_input_path.to_string_lossy().into_owned();
-    let initial_input = BytesInput::new(fs::read(&input)?);
+    let initial_input = BytesInput::new(fs::read(input)?);
 
     let mut elf_buf = Vec::new();
-    let elf = EasyElf::from_file(&binary, &mut elf_buf)?;
+    let elf = EasyElf::from_file(binary, &mut elf_buf)?;
 
     let env = env::vars()
         .filter(|(k, _v)| k != "LD_LIBRARY_PATH")
@@ -722,7 +931,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut qemu_args = Vec::with_capacity(2 + opts.target_args.len());
     qemu_args.push(env::args().next().unwrap());
     qemu_args.push(binary.to_string_lossy().into_owned());
-    qemu_args.extend(opts.target_args.into_iter().map(|arg| {
+    qemu_args.extend(opts.target_args.clone().into_iter().map(|arg| {
         if arg == "@@" {
             runtime_input_path_str.clone()
         } else {
@@ -730,200 +939,68 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }));
 
-    let full_backtrace = unsafe { FullBacktraceCollector::new() };
-    let runtime_function_tracker = RuntimeFunctionTracker::new();
-    let redirect_stdout = RedirectStdoutModule::new()
-        .with_stdout(suppress_guest_output)
-        .with_stderr(suppress_guest_output);
-
     let asan_filter = if !opts.asan_include.is_empty() {
-        StdAddressFilter::allow_list(opts.asan_include)
+        StdAddressFilter::allow_list(opts.asan_include.clone())
     } else if !opts.asan_exclude.is_empty() {
-        StdAddressFilter::deny_list(opts.asan_exclude)
+        StdAddressFilter::deny_list(opts.asan_exclude.clone())
     } else {
         StdAddressFilter::default()
     };
 
-    let asan_guest = if opts.no_asan {
-        log::info!("[asan-guest] [enabled false]");
-        AsanGuestModule::disabled(&env, asan_filter)
-    } else {
-        log::info!("[asan-guest] [enabled true]");
-        AsanGuestModule::new(&env, asan_filter)
-    };
-
-    let mut edges_observer = unsafe {
-        HitcountsMapObserver::new(VariableMapObserver::from_mut_slice(
-            "edges",
-            OwnedMutSlice::from_raw_parts_mut(edges_map_mut_ptr(), EDGES_MAP_ALLOCATED_SIZE),
-            &raw mut MAX_EDGES_FOUND,
-        ))
-        .track_indices()
-    };
-
-    let modules = tuple_list!(
-        redirect_stdout,
-        StdEdgeCoverageClassicModule::builder()
-            .map_observer(edges_observer.as_mut())
-            .build()?,
-        asan_guest,
-        CallTracerModule::new(
-            StdAddressFilter::default(),
-            tuple_list!(full_backtrace, runtime_function_tracker)
-        ),
-        StackTracePrinter {},
-    );
-
-    let time_observer = TimeObserver::new("time");
-    let mut feedback = feedback_or!(
-        MaxMapFeedback::new(&edges_observer),
-        TimeFeedback::new(&time_observer)
-    );
-    let mut objective = feedback_or_fast!(
-        CustomFilenameToTestcaseFeedback::new(generate_reached_filename::<State>),
-        TargetHitFeedback::new(MaxMapFeedback::with_name("edges_target", &edges_observer))
-    );
-
-    let mut state = StdState::new(
-        StdRand::new(),
-        InMemoryOnDiskCorpus::<BytesInput>::new(seeds_dir.clone())?,
-        OnDiskCorpus::<BytesInput>::new(reached_dir.clone())?,
-        &mut feedback,
-        &mut objective,
-    )?;
-
-    type State =
-        StdState<InMemoryOnDiskCorpus<BytesInput>, BytesInput, StdRand, OnDiskCorpus<BytesInput>>;
-
-    let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
-    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
-
-    let mut emulator: Emulator<
-        NopCommand,
-        NopCommandManager,
-        NopEmulatorDriver,
-        _,
-        BytesInput,
-        State,
-        NopSnapshotManager,
-    > = Emulator::empty()
-        .qemu_parameters(qemu_args)
-        .modules(modules)
-        .build()?;
-
-    let qemu = emulator.qemu();
-    let load_addr = qemu.load_addr();
-    let entry = elf
-        .entry_point(if elf.is_pic() { load_addr } else { 0 })
-        .ok_or_else(|| {
-            Box::new(Error::illegal_argument(format!(
-                "could not determine ELF entry point for {}",
-                binary.display()
-            ))) as Box<dyn std::error::Error>
-        })?;
-    log::info!("[entry] [address {entry:#x}]");
-
-    let entry_addr = entry as GuestAddr;
-    let target_exec_range = qemu.mappings().find_map(|map| {
-        let start = map.start() as GuestAddr;
-        let end = map.end() as GuestAddr;
-        (start <= entry_addr && entry_addr < end).then_some((start, end))
-    });
-    set_target_exec_range(target_exec_range);
-
-    let target_loc = opts.target_loc;
-    let target_loc_runtime: Option<usize> = if target_loc != 0 {
-        if elf.is_pic() {
-            Some(load_addr + target_loc)
-        } else {
-            Some(target_loc)
+    match opts.asan {
+        AsanMode::Guest => {
+            log::info!("[asan] [mode guest]");
+            run_fuzzer(
+                tuple_list!(AsanGuestModule::new(&env, asan_filter)),
+                &opts,
+                binary,
+                &elf,
+                qemu_args,
+                seeds_dir,
+                reached_dir,
+                output.to_path_buf(),
+                runtime_input_path,
+                initial_input,
+                seed_copy_path,
+            )
         }
-    } else {
-        None
-    };
-    match target_loc_runtime {
-        Some(addr) => log::info!("[target-info] [set true] [location {addr:#x}]"),
-        None => log::info!("[target-info] [set false] [location 0]"),
-    }
-
-    TARGET_LOC_COVERED.with(|state| {
-        state.set(false);
-    });
-    if let Some(addr) = target_loc_runtime {
-        emulator.modules_mut().instruction_function(
-            addr,
-            on_target_loc_covered::<_, BytesInput, State>,
-            true,
-        );
-    }
-
-    qemu.entry_break(entry);
-
-    emulator.set_target_crash_handling(&TargetSignalHandling::ReturnToHarness);
-
-    let monitor = SimpleMonitor::new(|s| log::info!("{s}"));
-    let mut mgr = SimpleEventManager::new(monitor);
-
-    let runtime_input_path_for_harness = output.join(".cur_input");
-    let mut harness = move |emulator: &mut Emulator<_, _, _, _, _, _, _>,
-                            _state: &mut State,
-                            input: &BytesInput|
-          -> ExitKind {
-        let target = input.target_bytes();
-        fs::write(&runtime_input_path_for_harness, target.as_slice())
-            .expect("failed to update runtime input file");
-
-        let qemu = emulator.qemu();
-        unsafe {
-            let exit_kind = match qemu.run() {
-                Ok(QemuExitReason::Crash) => ExitKind::Crash,
-                Ok(QemuExitReason::Timeout) => ExitKind::Timeout,
-                Ok(QemuExitReason::SyncExit) => ExitKind::Ok,
-                Ok(QemuExitReason::End(reason)) => {
-                    log::debug!("[qemu-end] [detail {}]", shutdown_cause_detail(&reason));
-                    ExitKind::Ok
-                }
-                Ok(QemuExitReason::Breakpoint(reason)) => {
-                    log::debug!("[qemu-breakpoint] [addr {reason:#x}]");
-                    ExitKind::Ok
-                }
-                Err(err) => {
-                    log::debug!("[qemu-error] [detail {:?}]", err);
-                    ExitKind::Crash
-                }
-            };
-
-            LAST_RUN_IS_CRASH.with(|state| state.set(matches!(exit_kind, ExitKind::Crash)));
-            exit_kind
+        AsanMode::Host => {
+            log::info!("[asan] [mode host]");
+            run_fuzzer(
+                tuple_list!(unsafe {
+                    AsanHostModule::builder()
+                        .env(&env)
+                        .filter(asan_filter)
+                        .asan_report()
+                        .build()
+                }),
+                &opts,
+                binary,
+                &elf,
+                qemu_args,
+                seeds_dir,
+                reached_dir,
+                output.to_path_buf(),
+                runtime_input_path,
+                initial_input,
+                seed_copy_path,
+            )
         }
-    };
-
-    let timeout = std::time::Duration::from_millis(1000);
-    let mut executor = libafl_qemu::executor::QemuExecutor::new(
-        emulator,
-        &mut harness,
-        tuple_list!(edges_observer, time_observer),
-        &mut fuzzer,
-        &mut state,
-        &mut mgr,
-        timeout,
-    )?;
-
-    state.corpus_mut().add(Testcase::new(initial_input))?;
-    log::info!("Seeded corpus from {}", input.display());
-
-    let mut stages = tuple_list!(StdMutationalStage::new(HavocScheduledMutator::new(
-        havoc_mutations()
-    )),);
-
-    log::info!(
-        "running {} with seed {}",
-        binary.display(),
-        seed_copy_path.display()
-    );
-
-    match fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr) {
-        Ok(()) | Err(Error::ShuttingDown) => Ok(()),
-        Err(err) => Err(err.into()),
+        AsanMode::None => {
+            log::info!("[asan] [mode none]");
+            run_fuzzer(
+                tuple_list!(),
+                &opts,
+                binary,
+                &elf,
+                qemu_args,
+                seeds_dir,
+                reached_dir,
+                output.to_path_buf(),
+                runtime_input_path,
+                initial_input,
+                seed_copy_path,
+            )
+        }
     }
 }
